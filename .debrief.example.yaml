@@ -1,0 +1,11 @@
+sources:
+  - name: my-app-stage
+    type: cloudwatch-spans
+    match: "app\\.example\\.com/chat/(?<id>[A-Za-z0-9_-]+)"
+    region: eu-west-1
+    logGroup: aws/spans
+    attribute: session.id
+    lookbackDays: 30
+    credentialProcess: "aws-vault export --format=json my-profile"
+redact:
+  - "sk-[A-Za-z0-9]{20,}"

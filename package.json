@@ -1,0 +1,31 @@
+{
+  "name": "debrief",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "debrief": "src/cli.ts"
+  },
+  "scripts": {
+    "start": "bun src/cli.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/cli.ts --compile --outfile dist/debrief",
+    "demo": "bun src/cli.ts examples/demo-trace.jsonl"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch-logs": "^3.1152.0",
+    "js-tiktoken": "^1.0.21",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "typescript": "^7.0.2"
+  },
+  "description": "Find out what happened in an AI agent chat that went wrong, from OpenTelemetry GenAI traces.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/glundgren93/debrief"
+  }
+}
