@@ -129,7 +129,7 @@ turn 1 step 4  tool search_flights result
 ### Commands
 
 ```
-debrief <chat>                       load a chat and summarize it (it stays loaded)
+debrief <chat>                       load a chat and summarize it (it stays loaded for later commands)
 debrief                              summarize the loaded chat again
 debrief turn N                       the steps in turn N on a timeline (start, duration, what ran in parallel)
 debrief turn N --all                 every step in turn N, in full
@@ -141,6 +141,7 @@ debrief turn N --step S --prompt     what the model received at that step: every
 debrief find TEXT                    steps that mention TEXT
 debrief find --errors                failed tool runs and turns with an error status
 
+--chat C    read chat C instead of the loaded one
 --json      machine-readable output (every item includes the command to open it)
 --full      do not shorten long text (with --prompt: print everything the model received)
 --refresh   fetch the chat again instead of using the cache
@@ -148,11 +149,21 @@ debrief find --errors                failed tool runs and turns with an error st
 
 `<chat>` is a link that matches a configured source, `<source>:<id>`, or a trace file. Exit codes: 0 ok, 1 usage or source error, 2 not found.
 
+### Which chat a command reads
+
+Every view names its chat in its first line. A command reads the first of:
+
+1. `--chat <chat>`: this command only. The `next:` commands it prints repeat it, as `--chat <source>:<id>`.
+2. `$DEBRIEF_CHAT`: this shell only.
+3. The loaded chat: whatever the last `debrief <chat>` loaded, from any shell. It is shared by every process.
+
+Use `--chat` or `$DEBRIEF_CHAT` when several investigations run at the same time, for example parallel agents; otherwise one `debrief <chat>` switches the chat for all of them.
+
 ### For coding agents
 
 Give your agent one line:
 
-> Use `debrief '<chat link>'` to investigate. Start with the summary, then follow the `next:` commands it prints.
+> Use `debrief --chat '<chat link>'` to investigate. Start with the summary, then follow the `next:` commands it prints.
 
 Every view supports `--json`, and every item in it carries the command that opens it. The prompt view's JSON includes the full text of every section and message item.
 

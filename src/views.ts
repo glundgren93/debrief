@@ -50,16 +50,26 @@ function clip(text: string, limit: TextLimit): { text: string; truncated: boolea
   return { text: text.slice(0, limit.maxChars), truncated: true };
 }
 
-export const commands = {
-  summary: () => BIN,
-  turn: (turn: number) => `${BIN} turn ${turn}`,
-  all: (turn: number) => `${BIN} turn ${turn} --all`,
-  step: (ref: StepRef) => `${BIN} turn ${ref.turn} --step ${ref.step}`,
-  prompt: (ref: StepRef) => `${BIN} turn ${ref.turn} --step ${ref.step} --prompt`,
-  fullPrompt: (ref: StepRef) => `${BIN} turn ${ref.turn} --step ${ref.step} --prompt --full`,
-  section: (ref: StepRef, name: string) => `${BIN} turn ${ref.turn} --step ${ref.step} --prompt --section ${name}`,
-  message: (ref: StepRef, number: number | string) => `${BIN} turn ${ref.turn} --step ${ref.step} --prompt --message ${number}`,
-};
+function shellQuote(value: string): string {
+  return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+export function commandsFor(chat?: string) {
+  const suffix = chat ? ` --chat ${shellQuote(chat)}` : "";
+  const turnCommand = (turn: number | string, rest = "") => `${BIN} turn ${turn}${rest}${suffix}`;
+  return {
+    summary: () => `${BIN}${suffix}`,
+    turn: (turn: number | string) => turnCommand(turn),
+    all: (turn: number) => turnCommand(turn, " --all"),
+    step: (ref: { turn: number; step: number | string }) => turnCommand(ref.turn, ` --step ${ref.step}`),
+    prompt: (ref: StepRef) => turnCommand(ref.turn, ` --step ${ref.step} --prompt`),
+    fullPrompt: (ref: StepRef) => turnCommand(ref.turn, ` --step ${ref.step} --prompt --full`),
+    section: (ref: StepRef, name: string) => turnCommand(ref.turn, ` --step ${ref.step} --prompt --section ${name}`),
+    message: (ref: StepRef, number: number | string) => turnCommand(ref.turn, ` --step ${ref.step} --prompt --message ${number}`),
+  };
+}
+
+export type Commands = ReturnType<typeof commandsFor>;
 
 function usageLine(usage: Usage | undefined): string {
   if (!usage) return "no token usage recorded";
@@ -119,7 +129,7 @@ function sumUsage(conversation: Conversation): Usage {
   };
 }
 
-export function summaryData(conversation: Conversation, index: StepIndex) {
+export function summaryData(conversation: Conversation, index: StepIndex, cmd: Commands) {
   return {
     chat: conversation.id,
     source: conversation.source,
@@ -134,10 +144,11 @@ export function summaryData(conversation: Conversation, index: StepIndex) {
         steps: steps.length,
         user: textOf(turn.userInput),
         reply: lastReply(steps),
-        open: commands.turn(turn.index + 1),
+        open: cmd.turn(turn.index + 1),
       };
     }),
     notRecorded: conversation.gaps,
+    next: conversation.turns.length === 1 ? cmd.turn(1) : conversation.turns.length > 1 ? cmd.turn("N") : cmd.summary(),
   };
 }
 
@@ -152,8 +163,7 @@ export function renderSummary(data: ReturnType<typeof summaryData>): string {
     lines.push("", "not recorded by the tracer:");
     for (const gap of data.notRecorded) lines.push(`  - ${gap.what}`);
   }
-  const next = data.turns.length === 1 ? commands.turn(1) : data.turns.length > 1 ? `${BIN} turn N` : commands.summary();
-  lines.push("", `next: ${next}`);
+  lines.push("", `next: ${data.next}`);
   return lines.join("\n");
 }
 
@@ -181,13 +191,15 @@ function spanCounts(spans: OtherSpan[]): string {
   return `${shown.join(", ")}${ranked.length > 3 ? ", …" : ""}`;
 }
 
-export function turnData(conversation: Conversation, index: StepIndex, turnNumber: number) {
+export function turnData(conversation: Conversation, index: StepIndex, turnNumber: number, cmd: Commands) {
   const turn = conversation.turns[turnNumber - 1];
   if (!turn) throw new Error(`turn ${turnNumber} missing`);
   const showAgent = hasSeveralAgents(conversation);
   const steps = index.steps(turnNumber);
   const turnStart = Date.parse(turn.startedAt);
+  const lastPrompt = [...steps].reverse().find((step) => step.kind === "model" && step.call.context);
   return {
+    chat: conversation.id,
     turn: turnNumber,
     of: conversation.turns.length,
     startedAt: turn.startedAt,
@@ -205,8 +217,8 @@ export function turnData(conversation: Conversation, index: StepIndex, turnNumbe
         summary: headline.text,
         detail: headline.detail,
         status: step.kind === "tool" ? step.tool.status : "ok",
-        open: commands.step({ turn: turnNumber, step: step.number }),
-        prompt: step.kind === "model" && step.call.context ? commands.prompt({ turn: turnNumber, step: step.number }) : undefined,
+        open: cmd.step({ turn: turnNumber, step: step.number }),
+        prompt: step.kind === "model" && step.call.context ? cmd.prompt({ turn: turnNumber, step: step.number }) : undefined,
       };
     }),
     withoutSteps: timelineGaps(turn, steps).map((gap) => ({
@@ -214,12 +226,15 @@ export function turnData(conversation: Conversation, index: StepIndex, turnNumbe
       durationMs: gap.durationMs,
       otherSpans: gap.otherSpans.map((span) => ({ ...span, offsetMs: Date.parse(span.startedAt) - turnStart })),
     })),
+    next: [cmd.step({ turn: turnNumber, step: "N" }), lastPrompt ? cmd.prompt({ turn: turnNumber, step: lastPrompt.number }) : undefined, cmd.all(turnNumber)].filter(
+      (hint): hint is string => hint !== undefined,
+    ),
   };
 }
 
 export function renderTurn(data: ReturnType<typeof turnData>): string {
   const status = data.status === "error" ? " · a span ended with an error" : "";
-  const lines = [`turn ${data.turn} of ${data.of} · ${data.startedAt.slice(11, 19)} · ${seconds(data.durationMs)} · ${plural(data.steps.length, "step")}${status}`, "", `user: ${data.user}`, ""];
+  const lines = [`chat ${data.chat} · turn ${data.turn} of ${data.of} · ${data.startedAt.slice(11, 19)} · ${seconds(data.durationMs)} · ${plural(data.steps.length, "step")}${status}`, "", `user: ${data.user}`, ""];
   const kindWidth = Math.max(9, ...data.steps.map((step) => step.kind.length));
   const detailPad = " ".repeat(3 + 2 + 8 + 2 + 7 + 2 + kindWidth + 2);
   const rows = [
@@ -243,13 +258,11 @@ export function renderTurn(data: ReturnType<typeof turnData>): string {
   }
   lines.push(`${"step".padStart(4)} ${"start".padStart(8)}  ${"took".padStart(7)}`);
   for (const row of rows) lines.push(...row.lines);
-  const lastModel = [...data.steps].reverse().find((step) => step.prompt);
-  const hints = [`${BIN} turn ${data.turn} --step N`, lastModel?.prompt, commands.all(data.turn)].filter(Boolean);
-  lines.push("", `next: ${hints.join("  ·  ")}`);
+  lines.push("", `next: ${data.next.join("  ·  ")}`);
   return lines.join("\n");
 }
 
-export function stepData(conversation: Conversation, index: StepIndex, step: Step) {
+export function stepData(conversation: Conversation, index: StepIndex, step: Step, cmd: Commands) {
   const ref = { turn: step.turn, step: step.number };
   const total = index.steps(step.turn).length;
   const timing = { offsetMs: step.offsetMs, durationMs: step.durationMs, alongside: step.alongside };
@@ -258,6 +271,7 @@ export function stepData(conversation: Conversation, index: StepIndex, step: Ste
     const requester = step.tool.callId ? index.requestingStep(step.tool.callId) : undefined;
     return {
       kind: "tool" as const,
+      chat: conversation.id,
       turn: step.turn,
       step: step.number,
       of: total,
@@ -268,12 +282,13 @@ export function stepData(conversation: Conversation, index: StepIndex, step: Ste
       result,
       resultTokens: step.tool.output ? countText(textOf(step.tool.output)) : 0,
       error: step.tool.error,
-      askedBy: requester ? commands.step({ turn: requester.turn, step: requester.number }) : undefined,
-      open: commands.step(ref),
+      askedBy: requester ? cmd.step({ turn: requester.turn, step: requester.number }) : undefined,
+      open: cmd.step(ref),
     };
   }
   return {
     kind: "model" as const,
+    chat: conversation.id,
     turn: step.turn,
     step: step.number,
     of: total,
@@ -286,10 +301,10 @@ export function stepData(conversation: Conversation, index: StepIndex, step: Ste
     reasoning: textOf((step.call.output?.parts ?? []).filter((part) => part.kind === "reasoning")).trim(),
     askedFor: toolCalls(step).map((call) => {
       const tool = index.toolStep(call.id);
-      return { tool: call.name, input: call.input, open: tool ? commands.step({ turn: tool.turn, step: tool.number }) : undefined };
+      return { tool: call.name, input: call.input, open: tool ? cmd.step({ turn: tool.turn, step: tool.number }) : undefined };
     }),
-    prompt: step.call.context ? commands.prompt(ref) : undefined,
-    open: commands.step(ref),
+    prompt: step.call.context ? cmd.prompt(ref) : undefined,
+    open: cmd.step(ref),
   };
 }
 
@@ -307,7 +322,7 @@ function timingLine(data: { offsetMs: number; durationMs: number; alongside: num
 export function renderStep(data: ReturnType<typeof stepData>, limit: TextLimit): string {
   const lines: string[] = [];
   if (data.kind === "tool") {
-    lines.push(`turn ${data.turn} · step ${data.step} of ${data.of} · tool ${data.tool} · ${data.status === "error" ? "failed" : "ok"}`, timingLine(data), "");
+    lines.push(`chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · tool ${data.tool} · ${data.status === "error" ? "failed" : "ok"}`, timingLine(data), "");
     lines.push(...block("input", pretty(data.input ?? ""), limit, data.open), "");
     lines.push(...block(`result (~${formatTokens(data.resultTokens)} tokens)`, data.result || "(not recorded)", limit, data.open));
     if (data.error) lines.push("", "error", indent(data.error));
@@ -315,7 +330,7 @@ export function renderStep(data: ReturnType<typeof stepData>, limit: TextLimit):
     return lines.join("\n");
   }
   lines.push(
-    `turn ${data.turn} · step ${data.step} of ${data.of} · model ${data.agent} · ${data.model}`,
+    `chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · model ${data.agent} · ${data.model}`,
     timingLine(data),
     `${usageLine(data.usage)}${data.finishReason ? ` · finished: ${data.finishReason}` : ""}`,
   );
@@ -330,11 +345,12 @@ export function renderStep(data: ReturnType<typeof stepData>, limit: TextLimit):
   return lines.join("\n");
 }
 
-export function promptData(index: StepIndex, step: Extract<Step, { kind: "model" }>) {
+export function promptData(index: StepIndex, step: Extract<Step, { kind: "model" }>, cmd: Commands) {
   const breakdown = promptBreakdown(step.call, index);
   if (!breakdown) return undefined;
   const ref = { turn: step.turn, step: step.number };
   return {
+    chat: index.conversation.id,
     turn: step.turn,
     step: step.number,
     usage: step.call.usage,
@@ -342,7 +358,7 @@ export function promptData(index: StepIndex, step: Extract<Step, { kind: "model"
     system: {
       tokens: breakdown.sections.reduce((sum, section) => sum + section.tokens, 0),
       text: breakdown.systemPrompt,
-      sections: breakdown.sections.map((section) => ({ name: section.name, tokens: section.tokens, text: section.text, open: commands.section(ref, section.name) })),
+      sections: breakdown.sections.map((section) => ({ name: section.name, tokens: section.tokens, text: section.text, open: cmd.section(ref, section.name) })),
     },
     tools: breakdown.toolDefinitions,
     messages: {
@@ -353,12 +369,13 @@ export function promptData(index: StepIndex, step: Extract<Step, { kind: "model"
         label: item.label,
         tokens: item.tokens,
         text: item.text,
-        from: item.ref ? commands.step(item.ref) : undefined,
-        open: commands.message(ref, item.number),
+        from: item.ref ? cmd.step(item.ref) : undefined,
+        open: cmd.message(ref, item.number),
       })),
     },
-    open: commands.prompt(ref),
-    full: commands.fullPrompt(ref),
+    open: cmd.prompt(ref),
+    full: cmd.fullPrompt(ref),
+    next: [`${cmd.fullPrompt(ref)}  (all of it, verbatim)`, cmd.section(ref, "NAME"), cmd.message(ref, "N")],
   };
 }
 
@@ -371,11 +388,10 @@ function toolsLine(tools: PromptData["tools"]): string {
 }
 
 function promptHeader(data: PromptData, what: string): string[] {
-  return [`turn ${data.turn} · step ${data.step} · ${what}`, `reported by the provider: ${usageLine(data.usage)}`];
+  return [`chat ${data.chat} · turn ${data.turn} · step ${data.step} · ${what}`, `reported by the provider: ${usageLine(data.usage)}`];
 }
 
 export function renderPrompt(data: PromptData): string {
-  const ref = { turn: data.turn, step: data.step };
   const lines = [...promptHeader(data, "what the model received, in the order it was sent"), "sizes below are estimates (o200k tokenizer)", ""];
   const row = (tokens: number | undefined, text: string, depth = 0) => {
     const size = tokens === undefined ? "" : formatTokens(tokens);
@@ -388,10 +404,7 @@ export function renderPrompt(data: PromptData): string {
   const numberWidth = String(data.messages.items.length).length;
   for (const item of data.messages.items) row(item.tokens, `${String(item.number).padStart(numberWidth)}  ${item.label}${item.from ? `  → ${item.from}` : ""}`, 1);
   if (data.unrecordedTokens > 0) row(data.unrecordedTokens, "reported input tokens not covered by the recorded content");
-  lines.push(
-    "",
-    `next: ${commands.fullPrompt(ref)}  (all of it, verbatim)  ·  ${commands.section(ref, "NAME")}  ·  ${commands.message(ref, "N")}`,
-  );
+  lines.push("", `next: ${data.next.join("  ·  ")}`);
   return lines.join("\n");
 }
 
@@ -428,29 +441,29 @@ function snippet(text: string, needle: string): string {
   return oneLine(`${start > 0 ? "…" : ""}${text.slice(start, at + needle.length + 60)}`, 120);
 }
 
-function errorHits(conversation: Conversation, index: StepIndex): FindHit[] {
+function errorHits(conversation: Conversation, index: StepIndex, cmd: Commands): FindHit[] {
   return conversation.turns.flatMap((turn) => {
     const turnNumber = turn.index + 1;
     const failed: FindHit[] = index
       .steps(turnNumber)
       .flatMap((step) =>
         step.kind === "tool" && step.tool.status === "error"
-          ? [{ turn: turnNumber, step: step.number, where: `tool ${step.tool.name} failed`, snippet: oneLine(step.tool.error ?? "", 120), open: commands.step({ turn: turnNumber, step: step.number }) }]
+          ? [{ turn: turnNumber, step: step.number, where: `tool ${step.tool.name} failed`, snippet: oneLine(step.tool.error ?? "", 120), open: cmd.step({ turn: turnNumber, step: step.number }) }]
           : [],
       );
-    if (failed.length === 0 && turn.status === "error") failed.push({ turn: turnNumber, where: "turn", snippet: "a span in this turn ended with an error status", open: commands.turn(turnNumber) });
+    if (failed.length === 0 && turn.status === "error") failed.push({ turn: turnNumber, where: "turn", snippet: "a span in this turn ended with an error status", open: cmd.turn(turnNumber) });
     return failed;
   });
 }
 
-export function find(conversation: Conversation, index: StepIndex, options: { text?: string; errors: boolean }): FindHit[] {
-  if (options.errors) return errorHits(conversation, index);
+export function find(conversation: Conversation, index: StepIndex, options: { text?: string; errors: boolean }, cmd: Commands): FindHit[] {
+  if (options.errors) return errorHits(conversation, index, cmd);
   const hits: FindHit[] = [];
   const needle = options.text ?? "";
   for (const turn of conversation.turns) {
     const turnNumber = turn.index + 1;
     const user = textOf(turn.userInput);
-    if (user.toLowerCase().includes(needle.toLowerCase())) hits.push({ turn: turnNumber, where: "user", snippet: snippet(user, needle), open: commands.turn(turnNumber) });
+    if (user.toLowerCase().includes(needle.toLowerCase())) hits.push({ turn: turnNumber, where: "user", snippet: snippet(user, needle), open: cmd.turn(turnNumber) });
     for (const step of index.steps(turnNumber)) {
       const ref = { turn: turnNumber, step: step.number };
       const fields =
@@ -464,16 +477,14 @@ export function find(conversation: Conversation, index: StepIndex, options: { te
               ["model asked for", toolCalls(step).map((call) => `${call.name} ${JSON.stringify(call.input)}`).join("\n")],
             ];
       for (const [where, text] of fields) {
-        if (where && text && text.toLowerCase().includes(needle.toLowerCase())) hits.push({ turn: turnNumber, step: step.number, where, snippet: snippet(text, needle), open: commands.step(ref) });
+        if (where && text && text.toLowerCase().includes(needle.toLowerCase())) hits.push({ turn: turnNumber, step: step.number, where, snippet: snippet(text, needle), open: cmd.step(ref) });
       }
     }
   }
   return hits;
 }
 
-export function renderFind(hits: FindHit[]): string {
-  if (hits.length === 0) return "no matches";
-  return hits
-    .map((hit) => `turn ${hit.turn}${hit.step ? ` step ${hit.step}` : ""}  ${hit.where}\n    ${hit.snippet}\n    → ${hit.open}`)
-    .join("\n");
+export function renderFind(chat: string, hits: FindHit[]): string {
+  const header = `chat ${chat} · ${hits.length === 0 ? "no matches" : `${hits.length} ${hits.length === 1 ? "match" : "matches"}`}`;
+  return [header, ...hits.map((hit) => `turn ${hit.turn}${hit.step ? ` step ${hit.step}` : ""}  ${hit.where}\n    ${hit.snippet}\n    → ${hit.open}`)].join("\n");
 }
