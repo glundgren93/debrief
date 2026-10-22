@@ -2,17 +2,16 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { parseArgs } from "node:util";
-import { analyze } from "./analyze.ts";
 import { loadConfig, resolveInput } from "./config.ts";
 import { buildConversation } from "./normalize.ts";
 import { cacheDir, load } from "./sources/index.ts";
 import { StepIndex } from "./steps.ts";
-import { buildTree } from "./tree.ts";
 import {
   BIN,
   find,
   promptData,
   renderFind,
+  renderFullPrompt,
   renderPrompt,
   renderStep,
   renderSummary,
@@ -26,19 +25,21 @@ const HELP = `${BIN}: find out what happened in an AI agent chat
 
   ${BIN} <chat>                       load a chat and summarize it (it stays loaded)
   ${BIN}                              summarize the loaded chat again
-  ${BIN} turn N                       the steps in turn N, in order (model calls and tool runs)
+  ${BIN} turn N                       the steps in turn N on a timeline (start, duration, what ran in parallel)
   ${BIN} turn N --all                 every step in turn N, in full
   ${BIN} turn N --step S              one step in full
-  ${BIN} turn N --step S --prompt     what the model received at that step, biggest parts first
-        --section NAME             print one system prompt section
+  ${BIN} turn N --step S --prompt     what the model received at that step: every part, in order, with sizes
+        --full                     all of it, verbatim
+        --section NAME             one system prompt section, verbatim
+        --message N                one message item, verbatim
   ${BIN} find TEXT                    steps that mention TEXT
-  ${BIN} find --errors                steps that failed
+  ${BIN} find --errors                failed tool runs and turns with an error status
 
   <chat> is a chat link your config knows about, <source>:<id>, or a trace file.
   Every view ends with the next command to run.
 
   --json      machine-readable output
-  --full      do not shorten long text
+  --full      do not shorten long text (with --prompt: print everything the model received)
   --refresh   fetch the chat again instead of using the 24 h cache
 
 examples
@@ -103,8 +104,7 @@ async function loadChat(chat: string, refresh: boolean) {
   for (const warning of loaded.warnings) console.error(`warning: ${warning}`);
   if (loaded.spans.length === 0) throw new NotFoundError(`No traces found for ${resolved.id} in ${loaded.sourceName}.`);
   const conversation = buildConversation(resolved.id, loaded.sourceName, loaded.spans);
-  const flags = analyze(conversation, buildTree(conversation));
-  return { conversation, flags, index: new StepIndex(conversation) };
+  return { conversation, index: new StepIndex(conversation) };
 }
 
 async function main(): Promise<number> {
@@ -115,6 +115,7 @@ async function main(): Promise<number> {
       step: { type: "string", short: "s" },
       prompt: { type: "boolean", default: false },
       section: { type: "string" },
+      message: { type: "string" },
       errors: { type: "boolean", default: false },
       json: { type: "boolean", default: false },
       full: { type: "boolean", default: false },
@@ -138,24 +139,24 @@ async function main(): Promise<number> {
     }
     const loaded = await loadChat(first, values.refresh);
     writeCurrent(first);
-    const data = summaryData(loaded.conversation, loaded.index, loaded.flags);
+    const data = summaryData(loaded.conversation, loaded.index);
     print(renderSummary(data), data);
     return 0;
   }
 
   const chat = readCurrent();
   if (!chat) throw new UsageError(`No chat loaded yet. Run: ${BIN} '<chat link>'`);
-  const { conversation, flags, index } = await loadChat(chat, values.refresh);
+  const { conversation, index } = await loadChat(chat, values.refresh);
 
   if (!first) {
-    const data = summaryData(conversation, index, flags);
+    const data = summaryData(conversation, index);
     print(renderSummary(data), data);
     return 0;
   }
 
   if (first === "find") {
     if (!second && !values.errors) throw new UsageError(`usage: ${BIN} find TEXT   or   ${BIN} find --errors`);
-    const hits = find(conversation, index, flags, { text: second, errors: values.errors });
+    const hits = find(conversation, index, { text: second, errors: values.errors });
     print(renderFind(hits), hits);
     return 0;
   }
@@ -167,13 +168,13 @@ async function main(): Promise<number> {
   const stepNumber = positiveInt(values.step, "--step");
 
   if (stepNumber === undefined) {
-    if (values.prompt || values.section) throw new UsageError(`--prompt needs a step: ${BIN} turn ${turn} --step S --prompt`);
+    if (values.prompt || values.section || values.message) throw new UsageError(`--prompt needs a step: ${BIN} turn ${turn} --step S --prompt`);
     if (values.all) {
       const steps = index.steps(turn).map((step) => stepData(conversation, index, step));
       print(steps.map((step) => renderStep(step, limit)).join("\n\n────────\n\n"), steps);
       return 0;
     }
-    const data = turnData(conversation, index, flags, turn);
+    const data = turnData(conversation, index, turn);
     print(renderTurn(data), data);
     return 0;
   }
@@ -181,22 +182,28 @@ async function main(): Promise<number> {
   const step = index.step(turn, stepNumber);
   if (!step) throw new NotFoundError(`There is no step ${stepNumber} in turn ${turn}; it has ${stepCount} step${stepCount === 1 ? "" : "s"}. See: ${BIN} turn ${turn}`);
 
-  if (values.prompt || values.section) {
+  if (values.prompt || values.section || values.message) {
     if (step.kind !== "model") throw new UsageError(`Step ${stepNumber} is a tool run, not a model call; only model calls have a prompt. See: ${BIN} turn ${turn}`);
     const data = promptData(index, step);
     if (!data) throw new NotFoundError(`The prompt for turn ${turn} step ${stepNumber} was not recorded.`);
     if (values.section) {
-      const text = data.sectionTexts[values.section];
-      if (text === undefined) {
-        const names = data.system.sections.map((section) => section.name);
+      const section = data.system.sections.find((item) => item.name === values.section);
+      if (!section) {
+        const names = data.system.sections.map((item) => item.name);
         const close = names.filter((name) => name.includes(values.section ?? "") || (values.section ?? "").includes(name));
         throw new NotFoundError(`No section "${values.section}".${close.length > 0 ? ` Did you mean: ${close.join(", ")}?` : ""} Sections: ${names.join(", ")}`);
       }
-      print(text, { turn, step: stepNumber, section: values.section, text });
+      print(section.text, { turn, step: stepNumber, section: section.name, tokens: section.tokens, text: section.text });
       return 0;
     }
-    const { sectionTexts: _texts, ...json } = data;
-    print(renderPrompt(data, values.full), json);
+    if (values.message) {
+      const number = positiveInt(values.message, "--message");
+      const item = data.messages.items.find((candidate) => candidate.number === number);
+      if (!item) throw new NotFoundError(`There is no message item ${values.message}; this prompt has ${data.messages.items.length}. See: ${data.open}`);
+      print(item.text, { turn, step: stepNumber, ...item });
+      return 0;
+    }
+    print(values.full ? renderFullPrompt(data) : renderPrompt(data), data);
     return 0;
   }
 

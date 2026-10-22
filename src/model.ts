@@ -25,6 +25,7 @@ export interface ToolDefinition {
 }
 
 export interface Context {
+  systemPrompt: string;
   system: Section[];
   tools: ToolDefinition[] | { notCaptured: true; names: string[] };
   messages: Message[];
@@ -62,6 +63,13 @@ export interface ToolExecution {
   error?: string;
 }
 
+export interface OtherSpan {
+  name: string;
+  startedAt: string;
+  durationMs: number;
+  status: "ok" | "error";
+}
+
 export interface Turn {
   index: number;
   traceId: string;
@@ -71,6 +79,7 @@ export interface Turn {
   userInput: Part[];
   calls: ModelCall[];
   tools: ToolExecution[];
+  otherSpans: OtherSpan[];
 }
 
 export interface CaptureGap {

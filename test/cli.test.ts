@@ -1,13 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { analyze } from "../src/analyze.ts";
-import { StepIndex } from "../src/steps.ts";
-import { find, flagRef, promptData } from "../src/views.ts";
+import { StepIndex, timelineGaps } from "../src/steps.ts";
+import { find, promptData, turnData } from "../src/views.ts";
 import { DEFAULT_REDACTIONS, resolveInput } from "../src/config.ts";
 import { parseOtelMessages, parseParts } from "../src/content.ts";
 import { buildConversation, splitSections } from "../src/normalize.ts";
 import { redact } from "../src/sources/index.ts";
 import { parseSpanRecords, parseSpanText } from "../src/spans.ts";
-import { buildTree, findNode } from "../src/tree.ts";
 import { agentSpan, blocks, chatSpan, span, tinyPng, toolSpan } from "./fixtures.ts";
 
 describe("content parsing", () => {
@@ -172,41 +170,6 @@ describe("conversation model", () => {
   });
 });
 
-describe("tree", () => {
-  test("addresses every node with a stable 1-based path", () => {
-    const tree = buildTree(sampleConversation());
-    expect(findNode(tree, "/turns/1/calls/2/context/messages/1/2")?.kind).toBe("media");
-    expect(findNode(tree, "turns/1/calls/1/context/system/1")?.name).toBe("<role>");
-    expect(findNode(tree, "/turns/9")).toBeUndefined();
-  });
-
-  test("shows reported input that captured content does not explain as unattributed", () => {
-    const tree = buildTree(sampleConversation());
-    const context = findNode(tree, "/turns/1/calls/1/context");
-    const unattributed = context?.children.find((child) => child.kind === "unattributed");
-    expect(context?.tokens).toBe(20000);
-    expect(unattributed?.tokens).toBeGreaterThan(19000);
-  });
-
-  test("names tool results after the tool call they answer", () => {
-    const tree = buildTree(sampleConversation());
-    expect(findNode(tree, "/turns/1/calls/2/context/messages/2/1")?.name).toBe("tool_result c1");
-  });
-});
-
-describe("flags", () => {
-  test("flags failed tools, oversized results, duplicate calls, resent media and cache misses", () => {
-    const conversation = sampleConversation();
-    const flags = analyze(conversation, buildTree(conversation));
-    const byId = (id: string) => flags.filter((flag) => flag.id === id);
-    expect(byId("tool_error")[0]).toMatchObject({ turn: 1, path: "/turns/1/tools/3" });
-    expect(byId("oversized_result")[0]).toMatchObject({ path: "/turns/1/tools/1/output" });
-    expect(byId("duplicate_tool_call")[0]).toMatchObject({ path: "/turns/1/tools/2" });
-    expect(byId("repeated_media")).toHaveLength(1);
-    expect(byId("cache_miss")[0]).toMatchObject({ turn: 2, path: "/turns/2/calls/1" });
-  });
-});
-
 describe("input resolution", () => {
   const config = {
     files: [],
@@ -247,32 +210,96 @@ describe("steps", () => {
     const step = index.step(1, 5);
     if (step?.kind !== "model") throw new Error("expected a model step");
     const prompt = promptData(index, step);
-    const result = prompt?.history.items.find((item) => item.label === "result of search");
-    expect(result?.from).toEqual({ turn: 1, step: 2 });
-    expect(result?.open).toBe("debrief turn 1 --step 2");
+    const result = prompt?.messages.items.find((item) => item.label === "result of search");
+    expect(result?.from).toBe("debrief turn 1 --step 2");
     expect(prompt?.unrecordedTokens).toBeGreaterThan(19000);
-  });
-
-  test("points flags at the step a person should open", () => {
-    const conversation = sampleConversation();
-    const index = new StepIndex(conversation);
-    const flags = analyze(conversation, buildTree(conversation));
-    const failure = flags.find((flag) => flag.id === "tool_error");
-    if (!failure) throw new Error("expected a tool_error flag");
-    expect(flagRef(failure, index)).toEqual({ ref: { turn: 1, step: 4 }, prompt: false });
   });
 
   test("finds text in tool input and model replies and says which step to open", () => {
     const conversation = sampleConversation();
     const index = new StepIndex(conversation);
-    const hits = find(conversation, index, [], { text: "CTR is", errors: false });
+    const hits = find(conversation, index, { text: "CTR is", errors: false });
     expect(hits).toEqual([expect.objectContaining({ turn: 2, step: 1, where: "model said", open: "debrief turn 2 --step 1" })]);
   });
 
   test("lists failed steps for find --errors", () => {
     const conversation = sampleConversation();
     const index = new StepIndex(conversation);
-    const hits = find(conversation, index, analyze(conversation, buildTree(conversation)), { errors: true });
+    const hits = find(conversation, index, { errors: true });
     expect(hits.map((hit) => hit.open)).toEqual(["debrief turn 1 --step 4"]);
+  });
+});
+
+function at<T extends { startNano: number; endNano: number }>(item: T, startMs: number, durationMs: number, origin: number): T {
+  return { ...item, startNano: origin + startMs * 1e6, endNano: origin + (startMs + durationMs) * 1e6 };
+}
+
+function parallelTurn() {
+  const root = span({ traceId: "t", name: "agent_streaming", durationMs: 6000 });
+  const origin = root.startNano;
+  const setup = at(span({ traceId: "t", name: "DynamoDB.GetItem", parent: root }), 10, 5, origin);
+  const fetch = at(span({ traceId: "t", name: "GET", parent: root, attributes: { "url.full": "https://context.example.com/skills" } }), 20, 300, origin);
+  const titleAgent = { ...at(agentSpan("t", "hi"), 750, 900, origin), parentSpanId: root.spanId };
+  const mainAgent = { ...at(agentSpan("t", "hi"), 760, 4800, origin), parentSpanId: root.spanId };
+  const title = at(chatSpan("t", titleAgent, [{ role: "system", content: blocks({ text: "Title it." }) }, { role: "user", content: blocks({ text: "<first_message>\nhi\n</first_message>" }) }], blocks({ text: "General Chat" }), { input: 40 }), 760, 890, origin);
+  const main = at(chatSpan("t", mainAgent, [{ role: "system", content: blocks({ text: "<role>\nHelp.\n</role>\n\n<rules>\nBe brief.\n</rules>" }) }, { role: "user", content: blocks({ text: "hi" }) }], blocks({ text: "Hello!" }), { input: 500, cacheWrite: 480 }), 770, 4800, origin);
+  const persist = at(span({ traceId: "t", name: "S3.PutObject", parent: root }), 5600, 80, origin);
+  return buildConversation("c", "test", [root, setup, fetch, titleAgent, mainAgent, title, main, persist]);
+}
+
+describe("timeline", () => {
+  test("says which steps ran at the same time instead of implying they ran one after another", () => {
+    const index = new StepIndex(parallelTurn());
+    expect(index.steps(1).map((step) => ({ step: step.number, offsetMs: step.offsetMs, alongside: step.alongside }))).toEqual([
+      { step: 1, offsetMs: 760, alongside: [2] },
+      { step: 2, offsetMs: 770, alongside: [1] },
+    ]);
+  });
+
+  test("accounts for time with no model or tool step and the other spans that start in it", () => {
+    const conversation = parallelTurn();
+    const index = new StepIndex(conversation);
+    const turn = conversation.turns[0];
+    if (!turn) throw new Error("expected a turn");
+    const gaps = timelineGaps(turn, index.steps(1));
+    expect(gaps.map((gap) => ({ offsetMs: gap.offsetMs, durationMs: gap.durationMs, spans: gap.otherSpans.map((other) => other.name) }))).toEqual([
+      { offsetMs: 0, durationMs: 760, spans: ["DynamoDB.GetItem", "GET context.example.com"] },
+      { offsetMs: 5570, durationMs: 430, spans: ["S3.PutObject"] },
+    ]);
+  });
+
+  test("leaves out spans that only wrap steps, such as the turn root", () => {
+    const turn = parallelTurn().turns[0];
+    expect(turn?.otherSpans.map((other) => other.name)).toEqual(["DynamoDB.GetItem", "GET context.example.com", "S3.PutObject"]);
+  });
+
+  test("reports the turn's timeline in turn view data", () => {
+    const conversation = parallelTurn();
+    const data = turnData(conversation, new StepIndex(conversation), 1);
+    expect(data.withoutSteps[0]?.otherSpans[1]).toMatchObject({ name: "GET context.example.com", offsetMs: 20, durationMs: 300 });
+  });
+});
+
+describe("prompt contents", () => {
+  test("numbers every message item and keeps its text verbatim, including wrappers", () => {
+    const conversation = parallelTurn();
+    const index = new StepIndex(conversation);
+    const step = index.step(1, 1);
+    if (step?.kind !== "model") throw new Error("expected a model step");
+    const prompt = promptData(index, step);
+    expect(prompt?.messages.items).toEqual([
+      expect.objectContaining({ number: 1, role: "user", text: "<first_message>\nhi\n</first_message>", open: "debrief turn 1 --step 1 --prompt --message 1" }),
+    ]);
+  });
+
+  test("keeps the system prompt exactly as sent alongside its sections", () => {
+    const conversation = parallelTurn();
+    const index = new StepIndex(conversation);
+    const step = index.step(1, 2);
+    if (step?.kind !== "model") throw new Error("expected a model step");
+    const prompt = promptData(index, step);
+    expect(prompt?.system.text).toBe("<role>\nHelp.\n</role>\n\n<rules>\nBe brief.\n</rules>");
+    expect(prompt?.system.sections.map((section) => section.name)).toEqual(["role", "rules"]);
+    expect(prompt?.usage).toMatchObject({ cacheWriteTokens: 480 });
   });
 });

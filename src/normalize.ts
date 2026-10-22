@@ -1,5 +1,5 @@
-import { parseOtelMessages, parseParts } from "./content.ts";
-import type { CaptureGap, Context, Conversation, Message, ModelCall, Part, Role, Section, ToolDefinition, ToolExecution, Turn, Usage } from "./model.ts";
+import { parseOtelMessages, parseParts, textOf } from "./content.ts";
+import type { CaptureGap, Context, Conversation, Message, ModelCall, OtherSpan, Part, Role, Section, ToolDefinition, ToolExecution, Turn, Usage } from "./model.ts";
 import { numberAttr, type Span, stringAttr } from "./spans.ts";
 
 const MESSAGE_EVENT_ROLES: Record<string, Role> = {
@@ -151,6 +151,7 @@ function contextOf(span: Span, agent: Span | undefined): { context: Context; out
   const names = agent ? toolNames(stringAttr(agent.attributes, "gen_ai.agent.tools")) : [];
   return {
     context: {
+      systemPrompt: textOf(system.filter((part) => part.kind === "text")),
       system: systemSections(system),
       tools: definitions ?? { notCaptured: true, names },
       messages,
@@ -215,6 +216,40 @@ function userInputOf(agent: Span | undefined, calls: ModelCall[]): Part[] {
   return lastUser?.parts ?? [];
 }
 
+function spanLabel(span: Span): string {
+  const url = stringAttr(span.attributes, "url.full", "http.url");
+  const host = stringAttr(span.attributes, "server.address") ?? (url ? safeHost(url) : undefined);
+  return host ? `${span.name} ${host}` : span.name;
+}
+
+function safeHost(url: string): string | undefined {
+  try {
+    return new URL(url).host;
+  } catch {
+    return undefined;
+  }
+}
+
+function otherSpansOf(spans: Span[], stepSpans: Span[], byId: Map<string, Span>): OtherSpan[] {
+  const containers = new Set<string>();
+  for (const span of stepSpans) {
+    let parent = span.parentSpanId ? byId.get(span.parentSpanId) : undefined;
+    while (parent && !containers.has(parent.spanId)) {
+      containers.add(parent.spanId);
+      parent = parent.parentSpanId ? byId.get(parent.parentSpanId) : undefined;
+    }
+  }
+  return spans
+    .filter((span) => operation(span) === undefined && !containers.has(span.spanId))
+    .sort((a, b) => a.startNano - b.startNano)
+    .map((span) => ({
+      name: spanLabel(span),
+      startedAt: isoTime(span.startNano),
+      durationMs: durationMs(span),
+      status: span.status === "error" ? "error" : "ok",
+    }));
+}
+
 function buildTurn(traceId: string, spans: Span[], index: number): Turn {
   const byId = new Map(spans.map((span) => [span.spanId, span]));
   const agents = spans.filter((span) => operation(span) === "invoke_agent");
@@ -240,10 +275,8 @@ function buildTurn(traceId: string, spans: Span[], index: number): Turn {
     };
   });
 
-  const tools = spans
-    .filter((span) => operation(span) === "execute_tool")
-    .sort((a, b) => a.startNano - b.startNano)
-    .map(toolExecution);
+  const toolSpans = spans.filter((span) => operation(span) === "execute_tool").sort((a, b) => a.startNano - b.startNano);
+  const tools = toolSpans.map(toolExecution);
 
   const start = Math.min(...spans.map((span) => span.startNano));
   const end = Math.max(...spans.map((span) => span.endNano));
@@ -258,6 +291,7 @@ function buildTurn(traceId: string, spans: Span[], index: number): Turn {
     userInput: userInputOf(agent, calls),
     calls,
     tools,
+    otherSpans: otherSpansOf(spans, [...chatSpans, ...toolSpans], byId),
   };
 }
 
@@ -276,7 +310,7 @@ function captureGaps(turns: Turn[]): CaptureGap[] {
   }
   if (calls.some((call) => call.context && !Array.isArray(call.context.tools))) {
     gaps.push({
-      what: "Tool definitions (gen_ai.tool.definitions) were not recorded; their tokens show up as unattributed.",
+      what: "Tool definitions (gen_ai.tool.definitions) were not recorded; only tool names are known.",
       howToEnable: "Record gen_ai.tool.definitions on the agent or model-call span. Some SDKs need an opt-in, some do not emit it yet.",
     });
   }
