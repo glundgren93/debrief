@@ -22,7 +22,7 @@ turn 3  09:10    4.43s   3 steps  "Yes, book it."
 not recorded by the tracer:
   - Tool definitions (gen_ai.tool.definitions) were not recorded; only tool names are known.
 
-next: debrief turn N
+next: debrief examples/demo-trace.jsonl turn N
 ```
 
 ## Where it fits
@@ -38,7 +38,7 @@ next: debrief turn N
                                                                    you, or a coding agent
 ```
 
-debrief never writes to your trace store. It fetches one conversation, keeps a local copy for 24 hours, and answers everything from that copy.
+debrief never writes to your trace store. Every command names the chat it reads. The first fetch keeps a local copy for 24 hours, and later commands on that chat answer from the copy.
 
 ## The model: chats, turns, steps
 
@@ -68,19 +68,19 @@ chat ─┬─ turn 1   "Find me the cheapest flight…"
 The loop:
 
 ```
-1. debrief '<chat link>'                  the turns
-2. debrief turn N                         the steps in a turn, on a timeline
-3. debrief turn N --step S                one step in full
-4. debrief turn N --step S --prompt       what the model received, part by part
-   ... --prompt --full                    all of it, verbatim
+1. debrief <chat>                                the turns
+2. debrief <chat> turn N                         the steps in a turn, on a timeline
+3. debrief <chat> turn N --step S                one step in full
+4. debrief <chat> turn N --step S --prompt       what the model received, part by part
+   ... --prompt --full                           all of it, verbatim
 ```
 
 Try it on the bundled demo:
 
 ```
 $ debrief examples/demo-trace.jsonl
-$ debrief turn 1
-turn 1 of 3 · 09:00:00 · 38.7s · 5 steps · a span ended with an error
+$ debrief examples/demo-trace.jsonl turn 1
+chat demo-trace.jsonl · turn 1 of 3 · 09:00:00 · 38.7s · 5 steps · a span ended with an error
 
 user: Find me the cheapest flight from Stockholm to Lisbon next Friday.
 
@@ -93,10 +93,10 @@ step    start     took
                                    → {"results":[{"flight_id":"F1000","airline":"TAP","depart":"2026-10-23T06:05","stops":0,"price_eur":212,"fare_rules":"Ha…
   5    +34.5s    4.20s  model      said: "The cheapest flight I found is TAP F1000 on Friday at 06:05 for €212, direct. Want me to book it?"
 
-next: debrief turn 1 --step N  ·  debrief turn 1 --step 5 --prompt  ·  debrief turn 1 --all
+next: debrief examples/demo-trace.jsonl turn 1 --step N  ·  debrief examples/demo-trace.jsonl turn 1 --step 5 --prompt  ·  debrief examples/demo-trace.jsonl turn 1 --all
 
-$ debrief turn 1 --step 5 --prompt
-turn 1 · step 5 · what the model received, in the order it was sent
+$ debrief examples/demo-trace.jsonl turn 1 --step 5 --prompt
+chat demo-trace.jsonl · turn 1 · step 5 · what the model received, in the order it was sent
 reported by the provider: 10.5k in · cache read 1.3k · cache write 9.2k · 70 out
 sizes below are estimates (o200k tokenizer)
 
@@ -108,62 +108,50 @@ sizes below are estimates (o200k tokenizer)
          tools: 4 names recorded, definitions not recorded
    9.2k  5 message items
               12  1  user message, turn 1
-              27  2  model asked for tools  → debrief turn 1 --step 1
-              15  3  result of search_flights (error)  → debrief turn 1 --step 2
-              22  4  model asked for tools  → debrief turn 1 --step 3
-            9.2k  5  result of search_flights  → debrief turn 1 --step 4
+              27  2  model asked for tools  → debrief examples/demo-trace.jsonl turn 1 --step 1
+              15  3  result of search_flights (error)  → debrief examples/demo-trace.jsonl turn 1 --step 2
+              22  4  model asked for tools  → debrief examples/demo-trace.jsonl turn 1 --step 3
+            9.2k  5  result of search_flights  → debrief examples/demo-trace.jsonl turn 1 --step 4
    1.2k  reported input tokens not covered by the recorded content
 
-next: debrief turn 1 --step 5 --prompt --full  (all of it, verbatim)  ·  debrief turn 1 --step 5 --prompt --section NAME  ·  debrief turn 1 --step 5 --prompt --message N
+next: debrief examples/demo-trace.jsonl turn 1 --step 5 --prompt --full  (all of it, verbatim)  ·  debrief examples/demo-trace.jsonl turn 1 --step 5 --prompt --section NAME  ·  debrief examples/demo-trace.jsonl turn 1 --step 5 --prompt --message N
 
-$ debrief turn 1 --step 5 --prompt --message 5
+$ debrief examples/demo-trace.jsonl turn 1 --step 5 --prompt --message 5
 {"results":[{"flight_id":"F1000","airline":"TAP","depart":"2026-10-23T06:05","stops":0,"price_eur":212,…
 
-$ debrief find 149
+$ debrief examples/demo-trace.jsonl find 149
 turn 1 step 4  tool search_flights result
     …", "stops": 0, "price_eur": 149, "fare_rules": "Hand luggage only. Changes allowed fo
-    → debrief turn 1 --step 4
+    → debrief examples/demo-trace.jsonl turn 1 --step 4
 …
 ```
 
 ### Commands
 
 ```
-debrief <chat>                       load a chat and summarize it (it stays loaded for later commands)
-debrief                              summarize the loaded chat again
-debrief turn N                       the steps in turn N on a timeline (start, duration, what ran in parallel)
-debrief turn N --all                 every step in turn N, in full
-debrief turn N --step S              one step in full
-debrief turn N --step S --prompt     what the model received at that step: every part, in order, with sizes
-      --full                         all of it, verbatim
-      --section NAME                 one system prompt section, verbatim
-      --message N                    one message item, verbatim
-debrief find TEXT                    steps that mention TEXT
-debrief find --errors                failed tool runs and turns with an error status
+debrief <chat>                              summarize the chat: its turns
+debrief <chat> turn N                       the steps in turn N on a timeline (start, duration, what ran in parallel)
+debrief <chat> turn N --all                 every step in turn N, in full
+debrief <chat> turn N --step S              one step in full
+debrief <chat> turn N --step S --prompt     what the model received at that step: every part, in order, with sizes
+      --full                                all of it, verbatim
+      --section NAME                        one system prompt section, verbatim
+      --message N                           one message item, verbatim
+debrief <chat> find TEXT                    steps that mention TEXT
+debrief <chat> find --errors                failed tool runs and turns with an error status
 
---chat C    read chat C instead of the loaded one
 --json      machine-readable output (every item includes the command to open it)
 --full      do not shorten long text (with --prompt: print everything the model received)
 --refresh   fetch the chat again instead of using the cache
 ```
 
-`<chat>` is a link that matches a configured source, `<source>:<id>`, or a trace file. Exit codes: 0 ok, 1 usage or source error, 2 not found.
-
-### Which chat a command reads
-
-Every view names its chat in its first line. A command reads the first of:
-
-1. `--chat <chat>`: this command only. The `next:` commands it prints repeat it, as `--chat <source>:<id>`.
-2. `$DEBRIEF_CHAT`: this shell only.
-3. The loaded chat: whatever the last `debrief <chat>` loaded, from any shell. It is shared by every process.
-
-Use `--chat` or `$DEBRIEF_CHAT` when several investigations run at the same time, for example parallel agents; otherwise one `debrief <chat>` switches the chat for all of them.
+`<chat>` is a link that matches a configured source, `<source>:<id>`, or a trace file. The `next:` commands name a source chat as `<source>:<id>`. Every view names its chat in its first line. Commands keep no state between runs, so any number of shells or agents can read different chats at the same time. Exit codes: 0 ok, 1 usage or source error, 2 not found.
 
 ### For coding agents
 
 Give your agent one line:
 
-> Use `debrief --chat '<chat link>'` to investigate. Start with the summary, then follow the `next:` commands it prints.
+> Use `debrief '<chat link>'` to investigate. Start with the summary, then follow the `next:` commands it prints.
 
 Every view supports `--json`, and every item in it carries the command that opens it. The prompt view's JSON includes the full text of every section and message item.
 

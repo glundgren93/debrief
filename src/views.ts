@@ -54,11 +54,11 @@ function shellQuote(value: string): string {
   return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-export function commandsFor(chat?: string) {
-  const suffix = chat ? ` --chat ${shellQuote(chat)}` : "";
-  const turnCommand = (turn: number | string, rest = "") => `${BIN} turn ${turn}${rest}${suffix}`;
+export function commandsFor(chat: string) {
+  const base = `${BIN} ${shellQuote(chat)}`;
+  const turnCommand = (turn: number | string, rest = "") => `${base} turn ${turn}${rest}`;
   return {
-    summary: () => `${BIN}${suffix}`,
+    summary: () => base,
     turn: (turn: number | string) => turnCommand(turn),
     all: (turn: number) => turnCommand(turn, " --all"),
     step: (ref: { turn: number; step: number | string }) => turnCommand(ref.turn, ` --step ${ref.step}`),

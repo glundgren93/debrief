@@ -212,24 +212,24 @@ describe("steps", () => {
     const index = new StepIndex(conversation);
     const step = index.step(1, 5);
     if (step?.kind !== "model") throw new Error("expected a model step");
-    const prompt = promptData(index, step, commandsFor());
+    const prompt = promptData(index, step, commandsFor("c"));
     const result = prompt?.messages.items.find((item) => item.label === "result of search");
-    expect(result?.from).toBe("debrief turn 1 --step 2");
+    expect(result?.from).toBe("debrief c turn 1 --step 2");
     expect(prompt?.unrecordedTokens).toBeGreaterThan(19000);
   });
 
   test("finds text in tool input and model replies and says which step to open", () => {
     const conversation = sampleConversation();
     const index = new StepIndex(conversation);
-    const hits = find(conversation, index, { text: "CTR is", errors: false }, commandsFor());
-    expect(hits).toEqual([expect.objectContaining({ turn: 2, step: 1, where: "model said", open: "debrief turn 2 --step 1" })]);
+    const hits = find(conversation, index, { text: "CTR is", errors: false }, commandsFor("c"));
+    expect(hits).toEqual([expect.objectContaining({ turn: 2, step: 1, where: "model said", open: "debrief c turn 2 --step 1" })]);
   });
 
   test("lists failed steps for find --errors", () => {
     const conversation = sampleConversation();
     const index = new StepIndex(conversation);
-    const hits = find(conversation, index, { errors: true }, commandsFor());
-    expect(hits.map((hit) => hit.open)).toEqual(["debrief turn 1 --step 4"]);
+    const hits = find(conversation, index, { errors: true }, commandsFor("c"));
+    expect(hits.map((hit) => hit.open)).toEqual(["debrief c turn 1 --step 4"]);
   });
 });
 
@@ -278,7 +278,7 @@ describe("timeline", () => {
 
   test("reports the turn's timeline in turn view data", () => {
     const conversation = parallelTurn();
-    const data = turnData(conversation, new StepIndex(conversation), 1, commandsFor());
+    const data = turnData(conversation, new StepIndex(conversation), 1, commandsFor("c"));
     expect(data.withoutSteps[0]?.otherSpans[1]).toMatchObject({ name: "GET context.example.com", offsetMs: 20, durationMs: 300 });
   });
 });
@@ -289,9 +289,9 @@ describe("prompt contents", () => {
     const index = new StepIndex(conversation);
     const step = index.step(1, 1);
     if (step?.kind !== "model") throw new Error("expected a model step");
-    const prompt = promptData(index, step, commandsFor());
+    const prompt = promptData(index, step, commandsFor("c"));
     expect(prompt?.messages.items).toEqual([
-      expect.objectContaining({ number: 1, role: "user", text: "<first_message>\nhi\n</first_message>", open: "debrief turn 1 --step 1 --prompt --message 1" }),
+      expect.objectContaining({ number: 1, role: "user", text: "<first_message>\nhi\n</first_message>", open: "debrief c turn 1 --step 1 --prompt --message 1" }),
     ]);
   });
 
@@ -300,14 +300,14 @@ describe("prompt contents", () => {
     const index = new StepIndex(conversation);
     const step = index.step(1, 2);
     if (step?.kind !== "model") throw new Error("expected a model step");
-    const prompt = promptData(index, step, commandsFor());
+    const prompt = promptData(index, step, commandsFor("c"));
     expect(prompt?.system.text).toBe("<role>\nHelp.\n</role>\n\n<rules>\nBe brief.\n</rules>");
     expect(prompt?.system.sections.map((section) => section.name)).toEqual(["role", "rules"]);
     expect(prompt?.usage).toMatchObject({ cacheWriteTokens: 480 });
   });
 });
 
-describe("which chat a command reads", () => {
+describe("naming the chat", () => {
   const cli = new URL("../src/cli.ts", import.meta.url).pathname;
   const demo = new URL("../examples/demo-trace.jsonl", import.meta.url).pathname;
 
@@ -315,40 +315,43 @@ describe("which chat a command reads", () => {
     const dir = mkdtempSync(join(tmpdir(), "debrief-test-"));
     const other = join(dir, "other-chat.jsonl");
     copyFileSync(demo, other);
-    const run = (args: string[], options: { cwd?: string; env?: Record<string, string> } = {}) => {
+    const run = (args: string[], options: { cwd?: string } = {}) => {
       const result = Bun.spawnSync(["bun", cli, ...args], {
         cwd: options.cwd ?? dir,
-        env: { ...process.env, DEBRIEF_CACHE_DIR: join(dir, "cache"), DEBRIEF_CHAT: "", ...options.env },
+        env: { ...process.env, DEBRIEF_CACHE_DIR: join(dir, "cache") },
       });
       return { out: result.stdout.toString(), err: result.stderr.toString(), code: result.exitCode };
     };
     return { dir, other, run };
   }
 
-  test("--chat reads that chat without changing the loaded one, and repeats itself in next commands", () => {
+  test("each command reads only the chat it names, so earlier commands do not change it", () => {
     const { other, run } = setup();
     run([demo]);
-    const viaFlag = run(["turn", "1", "--chat", other]);
-    expect(viaFlag.out.split("\n")[0]).toStartWith("chat other-chat.jsonl · turn 1");
-    expect(viaFlag.out).toContain(`next: debrief turn 1 --step N --chat ${other}`);
-    expect(run(["turn", "1"]).out.split("\n")[0]).toStartWith("chat demo-trace.jsonl · turn 1");
+    expect(run([other, "turn", "1"]).out.split("\n")[0]).toStartWith("chat other-chat.jsonl · turn 1");
+    expect(run([demo, "turn", "1"]).out.split("\n")[0]).toStartWith("chat demo-trace.jsonl · turn 1");
   });
 
-  test("$DEBRIEF_CHAT overrides the loaded chat for that process", () => {
+  test("next commands repeat the chat as it was given", () => {
+    const { run } = setup();
+    expect(run(["other-chat.jsonl", "turn", "1"]).out).toContain("next: debrief other-chat.jsonl turn 1 --step N");
+  });
+
+  test("a command without a chat says to give the chat first", () => {
+    const { run } = setup();
+    const result = run(["turn", "1"]);
+    expect(result.code).toBe(1);
+    expect(result.err).toContain("Give the chat first: debrief '<chat link>' turn 1");
+  });
+
+  test("suggests the closest command for a typo after the chat", () => {
     const { other, run } = setup();
-    run([demo]);
-    expect(run(["turn", "1"], { env: { DEBRIEF_CHAT: other } }).out.split("\n")[0]).toStartWith("chat other-chat.jsonl · turn 1");
-  });
-
-  test("a trace file loaded by relative path still resolves from another directory", () => {
-    const { dir, run } = setup();
-    run(["other-chat.jsonl"], { cwd: dir });
-    const elsewhere = run(["turn", "1"], { cwd: tmpdir() });
-    expect(elsewhere.code).toBe(0);
-    expect(elsewhere.out.split("\n")[0]).toStartWith("chat other-chat.jsonl · turn 1");
+    const result = run([other, "tunr", "1"]);
+    expect(result.code).toBe(1);
+    expect(result.err).toContain('Did you mean "turn"?');
   });
 
   test("quotes chat links with shell characters in next commands", () => {
-    expect(commandsFor("https://app.example.com/chat/abc?x=1&y=2").turn(1)).toBe("debrief turn 1 --chat 'https://app.example.com/chat/abc?x=1&y=2'");
+    expect(commandsFor("https://app.example.com/chat/abc?x=1&y=2").turn(1)).toBe("debrief 'https://app.example.com/chat/abc?x=1&y=2' turn 1");
   });
 });
