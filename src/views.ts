@@ -1,7 +1,6 @@
-import type { Flag } from "./analyze.ts";
 import { textOf } from "./content.ts";
-import type { Conversation, Part } from "./model.ts";
-import { promptBreakdown, type Step, type StepIndex, type StepRef } from "./steps.ts";
+import type { Conversation, OtherSpan, Part, Usage } from "./model.ts";
+import { promptBreakdown, type Step, type StepIndex, type StepRef, timelineGaps } from "./steps.ts";
 import { countText } from "./tokens.ts";
 
 export const BIN = "debrief";
@@ -13,7 +12,11 @@ export function formatTokens(tokens: number): string {
 }
 
 function seconds(ms: number): string {
-  return `${(ms / 1000).toFixed(1)}s`;
+  return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)}s`;
+}
+
+function offset(ms: number): string {
+  return `+${seconds(ms)}`;
 }
 
 function oneLine(value: unknown, length: number): string {
@@ -34,6 +37,10 @@ function indent(text: string, spaces = 2): string {
     .join("\n");
 }
 
+function plural(count: number, word: string): string {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
+
 export interface TextLimit {
   maxChars?: number;
 }
@@ -43,19 +50,43 @@ function clip(text: string, limit: TextLimit): { text: string; truncated: boolea
   return { text: text.slice(0, limit.maxChars), truncated: true };
 }
 
-export const commands = {
-  summary: () => BIN,
-  turn: (turn: number) => `${BIN} turn ${turn}`,
-  all: (turn: number) => `${BIN} turn ${turn} --all`,
-  step: (ref: StepRef) => `${BIN} turn ${ref.turn} --step ${ref.step}`,
-  prompt: (ref: StepRef) => `${BIN} turn ${ref.turn} --step ${ref.step} --prompt`,
-  section: (ref: StepRef, name: string) => `${BIN} turn ${ref.turn} --step ${ref.step} --prompt --section ${name}`,
-};
+function shellQuote(value: string): string {
+  return /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
+}
 
-function dominantAgent(conversation: Conversation): string | undefined {
-  const counts = new Map<string, number>();
-  for (const call of conversation.turns.flatMap((turn) => turn.calls)) counts.set(call.agent, (counts.get(call.agent) ?? 0) + 1);
-  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+export function commandsFor(chat: string) {
+  const base = `${BIN} ${shellQuote(chat)}`;
+  const turnCommand = (turn: number | string, rest = "") => `${base} turn ${turn}${rest}`;
+  return {
+    summary: () => base,
+    turn: (turn: number | string) => turnCommand(turn),
+    all: (turn: number) => turnCommand(turn, " --all"),
+    step: (ref: { turn: number; step: number | string }) => turnCommand(ref.turn, ` --step ${ref.step}`),
+    prompt: (ref: StepRef) => turnCommand(ref.turn, ` --step ${ref.step} --prompt`),
+    fullPrompt: (ref: StepRef) => turnCommand(ref.turn, ` --step ${ref.step} --prompt --full`),
+    section: (ref: StepRef, name: string) => turnCommand(ref.turn, ` --step ${ref.step} --prompt --section ${name}`),
+    message: (ref: StepRef, number: number | string) => turnCommand(ref.turn, ` --step ${ref.step} --prompt --message ${number}`),
+  };
+}
+
+export type Commands = ReturnType<typeof commandsFor>;
+
+function usageLine(usage: Usage | undefined): string {
+  if (!usage) return "no token usage recorded";
+  const cache = [
+    usage.cacheReadTokens !== undefined ? `cache read ${formatTokens(usage.cacheReadTokens)}` : "",
+    usage.cacheWriteTokens !== undefined ? `cache write ${formatTokens(usage.cacheWriteTokens)}` : "",
+  ].filter(Boolean);
+  return [`${formatTokens(usage.inputTokens)} in`, ...cache, `${formatTokens(usage.outputTokens)} out`].join(" · ");
+}
+
+function alongsideText(alongside: number[]): string {
+  if (alongside.length === 0) return "";
+  return `at the same time as step${alongside.length === 1 ? "" : "s"} ${alongside.join(", ")}`;
+}
+
+function hasSeveralAgents(conversation: Conversation): boolean {
+  return new Set(conversation.turns.flatMap((turn) => turn.calls.map((call) => call.agent))).size > 1;
 }
 
 function resultValue(parts: Part[] | undefined): unknown {
@@ -81,43 +112,28 @@ function askedFor(step: Extract<Step, { kind: "model" }>): string {
   return [...counts.entries()].map(([name, count]) => (count > 1 ? `${name} ×${count}` : name)).join(", ");
 }
 
-function cacheShare(input?: number, cacheRead?: number): string {
-  if (!input || cacheRead === undefined) return "";
-  return ` (${Math.round((cacheRead / input) * 100)}% from cache)`;
-}
-
-export function flagRef(flag: Flag, index: StepIndex): { ref?: StepRef; prompt: boolean } {
-  const match = /^\/turns\/(\d+)(?:\/(calls|tools)\/(\d+))?(\/context)?/.exec(flag.path ?? "");
-  if (!match) return { prompt: false };
-  const turn = Number(match[1]);
-  if (!match[2]) return { ref: { turn, step: 1 }, prompt: false };
-  const position = Number(match[3]) - 1;
-  const step = match[2] === "calls" ? index.stepForCall(turn, position) : index.stepForTool(turn, position);
-  return { ref: step ? { turn, step: step.number } : undefined, prompt: Boolean(match[4]) };
-}
-
-function flagCommand(flag: Flag, index: StepIndex): string | undefined {
-  const { ref, prompt } = flagRef(flag, index);
-  if (!ref) return undefined;
-  return prompt ? commands.prompt(ref) : commands.step(ref);
-}
-
-const MARK: Record<Flag["severity"], string> = { error: "✗", warn: "!", info: "·" };
-
 function lastReply(steps: Step[]): string {
   for (const step of [...steps].reverse()) if (step.kind === "model" && said(step)) return said(step);
   return "";
 }
 
-export function summaryData(conversation: Conversation, index: StepIndex, flags: Flag[]) {
-  const calls = conversation.turns.flatMap((turn) => turn.calls);
-  const input = calls.reduce((sum, call) => sum + (call.usage?.inputTokens ?? 0), 0);
-  const cached = calls.reduce((sum, call) => sum + (call.usage?.cacheReadTokens ?? 0), 0);
+function sumUsage(conversation: Conversation): Usage {
+  const usages = conversation.turns.flatMap((turn) => turn.calls).flatMap((call) => (call.usage ? [call.usage] : []));
+  const total = (pick: (usage: Usage) => number | undefined) =>
+    usages.some((usage) => pick(usage) !== undefined) ? usages.reduce((sum, usage) => sum + (pick(usage) ?? 0), 0) : undefined;
+  return {
+    inputTokens: total((usage) => usage.inputTokens) ?? 0,
+    outputTokens: total((usage) => usage.outputTokens) ?? 0,
+    cacheReadTokens: total((usage) => usage.cacheReadTokens),
+    cacheWriteTokens: total((usage) => usage.cacheWriteTokens),
+  };
+}
+
+export function summaryData(conversation: Conversation, index: StepIndex, cmd: Commands) {
   return {
     chat: conversation.id,
     source: conversation.source,
-    inputTokens: input,
-    cacheReadTokens: cached,
+    usage: sumUsage(conversation),
     turns: conversation.turns.map((turn) => {
       const steps = index.steps(turn.index + 1);
       return {
@@ -128,144 +144,167 @@ export function summaryData(conversation: Conversation, index: StepIndex, flags:
         steps: steps.length,
         user: textOf(turn.userInput),
         reply: lastReply(steps),
-        open: commands.turn(turn.index + 1),
+        open: cmd.turn(turn.index + 1),
       };
     }),
-    flags: flags.map((flag) => ({ ...flag, path: undefined, open: flagCommand(flag, index) })),
     notRecorded: conversation.gaps,
+    next: conversation.turns.length === 1 ? cmd.turn(1) : conversation.turns.length > 1 ? cmd.turn("N") : cmd.summary(),
   };
 }
 
 export function renderSummary(data: ReturnType<typeof summaryData>): string {
-  const lines = [
-    `chat ${data.chat} · ${data.source} · ${data.turns.length} turns · ${formatTokens(data.inputTokens)} tokens in${cacheShare(data.inputTokens, data.cacheReadTokens)}`,
-    "",
-  ];
+  const lines = [`chat ${data.chat} · ${data.source} · ${plural(data.turns.length, "turn")} · ${usageLine(data.usage)}`, ""];
   for (const turn of data.turns) {
-    const flags = data.flags.filter((flag) => flag.turn === turn.turn);
-    const mark = turn.status === "error" || flags.some((flag) => flag.severity === "error") ? "✗" : flags.some((flag) => flag.severity === "warn") ? "!" : " ";
-    lines.push(`${mark} turn ${turn.turn}  ${turn.startedAt.slice(11, 16)}  ${seconds(turn.durationMs).padStart(6)}  ${String(turn.steps).padStart(2)} steps  "${oneLine(turn.user, 70)}"`);
-    if (turn.reply) lines.push(`         reply: "${oneLine(turn.reply, 90)}"`);
-    for (const flag of flags) lines.push(`         ${MARK[flag.severity]} ${flag.message}${flag.open ? `  → ${flag.open}` : ""}`);
-  }
-  const global = data.flags.filter((flag) => flag.turn === undefined);
-  if (global.length > 0) {
-    lines.push("");
-    for (const flag of global) lines.push(`${MARK[flag.severity]} ${flag.message}${flag.open ? `  → ${flag.open}` : ""}`);
+    const status = turn.status === "error" ? " · a span ended with an error" : "";
+    lines.push(`turn ${turn.turn}  ${turn.startedAt.slice(11, 16)}  ${seconds(turn.durationMs).padStart(7)}  ${plural(turn.steps, "step").padStart(8)}  "${oneLine(turn.user, 70)}"${status}`);
+    if (turn.reply) lines.push(`        reply: "${oneLine(turn.reply, 90)}"`);
   }
   if (data.notRecorded.length > 0) {
     lines.push("", "not recorded by the tracer:");
     for (const gap of data.notRecorded) lines.push(`  - ${gap.what}`);
   }
-  const worst = data.turns.find((turn) => data.flags.some((flag) => flag.turn === turn.turn && flag.severity !== "info")) ?? data.turns[data.turns.length - 1];
-  lines.push("", `next: ${worst ? worst.open : commands.summary()}`);
+  lines.push("", `next: ${data.next}`);
   return lines.join("\n");
 }
 
-function stepHeadline(step: Step, mainAgent: string | undefined): { kind: string; text: string; detail?: string } {
+function stepHeadline(step: Step, showAgent: boolean): { kind: string; text: string; detail?: string } {
   if (step.kind === "tool") {
-    const status = step.tool.status === "error" ? "  ✗ failed" : "";
+    const status = step.tool.status === "error" ? "  (failed)" : "";
     return {
       kind: "tool",
       text: `${step.tool.name}  ${oneLine(step.tool.input ?? "", 110)}${status}`,
       detail: step.tool.error ? `error: ${oneLine(step.tool.error, 120)}` : `→ ${oneLine(resultValue(step.tool.output), 120)}`,
     };
   }
-  const agent = mainAgent && step.call.agent !== mainAgent ? ` (${step.call.agent})` : "";
+  const agent = showAgent ? ` (${step.call.agent})` : "";
   const text = said(step);
   const asked = askedFor(step);
   const bits = [text ? `said: "${oneLine(text, 100)}"` : "", asked ? `asked for ${asked}` : ""].filter(Boolean);
   return { kind: `model${agent}`, text: bits.join("  ·  ") || "(output not recorded)" };
 }
 
-export function turnData(conversation: Conversation, index: StepIndex, flags: Flag[], turnNumber: number) {
+function spanCounts(spans: OtherSpan[]): string {
+  const counts = new Map<string, number>();
+  for (const span of spans) counts.set(span.name, (counts.get(span.name) ?? 0) + 1);
+  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const shown = ranked.slice(0, 3).map(([name, count]) => (count > 1 ? `${name} ×${count}` : name));
+  return `${shown.join(", ")}${ranked.length > 3 ? ", …" : ""}`;
+}
+
+export function turnData(conversation: Conversation, index: StepIndex, turnNumber: number, cmd: Commands) {
   const turn = conversation.turns[turnNumber - 1];
   if (!turn) throw new Error(`turn ${turnNumber} missing`);
-  const mainAgent = dominantAgent(conversation);
+  const showAgent = hasSeveralAgents(conversation);
   const steps = index.steps(turnNumber);
+  const turnStart = Date.parse(turn.startedAt);
+  const lastPrompt = [...steps].reverse().find((step) => step.kind === "model" && step.call.context);
   return {
+    chat: conversation.id,
     turn: turnNumber,
     of: conversation.turns.length,
     startedAt: turn.startedAt,
     durationMs: turn.durationMs,
+    status: turn.status,
     user: textOf(turn.userInput),
     steps: steps.map((step) => {
-      const headline = stepHeadline(step, mainAgent);
+      const headline = stepHeadline(step, showAgent);
       return {
         step: step.number,
         kind: headline.kind,
+        offsetMs: step.offsetMs,
         durationMs: step.durationMs,
+        alongside: step.alongside,
         summary: headline.text,
         detail: headline.detail,
         status: step.kind === "tool" ? step.tool.status : "ok",
-        open: commands.step({ turn: turnNumber, step: step.number }),
-        prompt: step.kind === "model" && step.call.context ? commands.prompt({ turn: turnNumber, step: step.number }) : undefined,
+        open: cmd.step({ turn: turnNumber, step: step.number }),
+        prompt: step.kind === "model" && step.call.context ? cmd.prompt({ turn: turnNumber, step: step.number }) : undefined,
       };
     }),
-    flags: flags.filter((flag) => flag.turn === turnNumber).map((flag) => ({ ...flag, path: undefined, open: flagCommand(flag, index) })),
+    withoutSteps: timelineGaps(turn, steps).map((gap) => ({
+      offsetMs: gap.offsetMs,
+      durationMs: gap.durationMs,
+      otherSpans: gap.otherSpans.map((span) => ({ ...span, offsetMs: Date.parse(span.startedAt) - turnStart })),
+    })),
+    next: [cmd.step({ turn: turnNumber, step: "N" }), lastPrompt ? cmd.prompt({ turn: turnNumber, step: lastPrompt.number }) : undefined, cmd.all(turnNumber)].filter(
+      (hint): hint is string => hint !== undefined,
+    ),
   };
 }
 
 export function renderTurn(data: ReturnType<typeof turnData>): string {
-  const lines = [`turn ${data.turn} of ${data.of} · ${data.startedAt.slice(11, 19)} · ${seconds(data.durationMs)} · ${data.steps.length} steps`, "", `user: ${data.user}`, ""];
-  const kindWidth = Math.max(5, ...data.steps.map((step) => step.kind.length));
-  for (const step of data.steps) {
-    lines.push(`${String(step.step).padStart(3)}  ${step.kind.padEnd(kindWidth)}  ${seconds(step.durationMs).padStart(6)}  ${step.summary}`);
-    if (step.detail) lines.push(`${" ".repeat(kindWidth + 15)}${step.detail}`);
+  const status = data.status === "error" ? " · a span ended with an error" : "";
+  const lines = [`chat ${data.chat} · turn ${data.turn} of ${data.of} · ${data.startedAt.slice(11, 19)} · ${seconds(data.durationMs)} · ${plural(data.steps.length, "step")}${status}`, "", `user: ${data.user}`, ""];
+  const kindWidth = Math.max(9, ...data.steps.map((step) => step.kind.length));
+  const detailPad = " ".repeat(3 + 2 + 8 + 2 + 7 + 2 + kindWidth + 2);
+  const rows = [
+    ...data.steps.map((step) => ({ offsetMs: step.offsetMs, order: 1, lines: stepRows(step) })),
+    ...data.withoutSteps.map((gap) => ({
+      offsetMs: gap.offsetMs,
+      order: 0,
+      lines: [
+        `${"".padStart(3)}  ${offset(gap.offsetMs).padStart(8)}  ${seconds(gap.durationMs).padStart(7)}  ${"(no step)".padEnd(kindWidth)}  ${
+          gap.otherSpans.length > 0 ? `${plural(gap.otherSpans.length, "other span")} start here: ${spanCounts(gap.otherSpans)}` : "no spans start here"
+        }`,
+      ],
+    })),
+  ].sort((a, b) => a.offsetMs - b.offsetMs || a.order - b.order);
+  function stepRows(step: (typeof data.steps)[number]): string[] {
+    const out = [`${String(step.step).padStart(3)}  ${offset(step.offsetMs).padStart(8)}  ${seconds(step.durationMs).padStart(7)}  ${step.kind.padEnd(kindWidth)}  ${step.summary}`];
+    if (step.detail) out.push(`${detailPad}${step.detail}`);
+    const alongside = alongsideText(step.alongside);
+    if (alongside) out.push(`${detailPad}${alongside}`);
+    return out;
   }
-  if (data.flags.length > 0) {
-    lines.push("");
-    for (const flag of data.flags) lines.push(`${MARK[flag.severity]} ${flag.message}${flag.open ? `  → ${flag.open}` : ""}`);
-  }
-  const lastModel = [...data.steps].reverse().find((step) => step.prompt);
-  const hints = [commands.step({ turn: data.turn, step: 1 }).replace(/--step 1$/, "--step N"), lastModel?.prompt, commands.all(data.turn)].filter(Boolean);
-  lines.push("", `next: ${hints.join("  ·  ")}`);
+  lines.push(`${"step".padStart(4)} ${"start".padStart(8)}  ${"took".padStart(7)}`);
+  for (const row of rows) lines.push(...row.lines);
+  lines.push("", `next: ${data.next.join("  ·  ")}`);
   return lines.join("\n");
 }
 
-export function stepData(conversation: Conversation, index: StepIndex, step: Step) {
+export function stepData(conversation: Conversation, index: StepIndex, step: Step, cmd: Commands) {
   const ref = { turn: step.turn, step: step.number };
   const total = index.steps(step.turn).length;
+  const timing = { offsetMs: step.offsetMs, durationMs: step.durationMs, alongside: step.alongside };
   if (step.kind === "tool") {
     const result = resultText(step.tool.output);
     const requester = step.tool.callId ? index.requestingStep(step.tool.callId) : undefined;
     return {
       kind: "tool" as const,
+      chat: conversation.id,
       turn: step.turn,
       step: step.number,
       of: total,
       tool: step.tool.name,
-      durationMs: step.durationMs,
+      ...timing,
       status: step.tool.status,
       input: step.tool.input,
       result,
       resultTokens: step.tool.output ? countText(textOf(step.tool.output)) : 0,
       error: step.tool.error,
-      askedBy: requester ? commands.step({ turn: requester.turn, step: requester.number }) : undefined,
-      open: commands.step(ref),
+      askedBy: requester ? cmd.step({ turn: requester.turn, step: requester.number }) : undefined,
+      open: cmd.step(ref),
     };
   }
-  const usage = step.call.usage;
   return {
     kind: "model" as const,
+    chat: conversation.id,
     turn: step.turn,
     step: step.number,
     of: total,
     agent: step.call.agent,
     model: step.call.model,
-    durationMs: step.durationMs,
-    inputTokens: usage?.inputTokens,
-    cacheReadTokens: usage?.cacheReadTokens,
-    outputTokens: usage?.outputTokens,
+    ...timing,
+    usage: step.call.usage,
     finishReason: step.call.finishReason,
     said: said(step),
     reasoning: textOf((step.call.output?.parts ?? []).filter((part) => part.kind === "reasoning")).trim(),
     askedFor: toolCalls(step).map((call) => {
       const tool = index.toolStep(call.id);
-      return { tool: call.name, input: call.input, open: tool ? commands.step({ turn: tool.turn, step: tool.number }) : undefined };
+      return { tool: call.name, input: call.input, open: tool ? cmd.step({ turn: tool.turn, step: tool.number }) : undefined };
     }),
-    prompt: step.call.context ? commands.prompt(ref) : undefined,
-    open: commands.step(ref),
+    prompt: step.call.context ? cmd.prompt(ref) : undefined,
+    open: cmd.step(ref),
   };
 }
 
@@ -276,21 +315,25 @@ function block(title: string, text: string, limit: TextLimit, more: string): str
   return lines;
 }
 
+function timingLine(data: { offsetMs: number; durationMs: number; alongside: number[] }): string {
+  return [`started ${offset(data.offsetMs)} into the turn`, `took ${seconds(data.durationMs)}`, alongsideText(data.alongside)].filter(Boolean).join(" · ");
+}
+
 export function renderStep(data: ReturnType<typeof stepData>, limit: TextLimit): string {
   const lines: string[] = [];
   if (data.kind === "tool") {
-    lines.push(`turn ${data.turn} · step ${data.step} of ${data.of} · tool ${data.tool} · ${seconds(data.durationMs)} · ${data.status === "error" ? "failed" : "ok"}`, "");
+    lines.push(`chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · tool ${data.tool} · ${data.status === "error" ? "failed" : "ok"}`, timingLine(data), "");
     lines.push(...block("input", pretty(data.input ?? ""), limit, data.open), "");
-    lines.push(...block(`result (${formatTokens(data.resultTokens)} tokens sent back to the model)`, data.result || "(not recorded)", limit, data.open));
+    lines.push(...block(`result (~${formatTokens(data.resultTokens)} tokens)`, data.result || "(not recorded)", limit, data.open));
     if (data.error) lines.push("", "error", indent(data.error));
     if (data.askedBy) lines.push("", `next: ${data.askedBy}  (the model step that asked for this)`);
     return lines.join("\n");
   }
-  const usage =
-    data.inputTokens !== undefined
-      ? `${formatTokens(data.inputTokens)} tokens in${cacheShare(data.inputTokens, data.cacheReadTokens)} · ${formatTokens(data.outputTokens ?? 0)} out`
-      : "no token usage recorded";
-  lines.push(`turn ${data.turn} · step ${data.step} of ${data.of} · model ${data.agent} · ${data.model} · ${seconds(data.durationMs)}`, `${usage}${data.finishReason ? ` · finished: ${data.finishReason}` : ""}`);
+  lines.push(
+    `chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · model ${data.agent} · ${data.model}`,
+    timingLine(data),
+    `${usageLine(data.usage)}${data.finishReason ? ` · finished: ${data.finishReason}` : ""}`,
+  );
   if (data.reasoning) lines.push("", ...block("thought", data.reasoning, limit, data.open));
   if (data.said) lines.push("", ...block("said", data.said, limit, data.open));
   if (data.askedFor.length > 0) {
@@ -302,75 +345,86 @@ export function renderStep(data: ReturnType<typeof stepData>, limit: TextLimit):
   return lines.join("\n");
 }
 
-const TOP_ITEMS = 8;
-
-export function promptData(index: StepIndex, step: Extract<Step, { kind: "model" }>) {
+export function promptData(index: StepIndex, step: Extract<Step, { kind: "model" }>, cmd: Commands) {
   const breakdown = promptBreakdown(step.call, index);
   if (!breakdown) return undefined;
   const ref = { turn: step.turn, step: step.number };
-  const systemTokens = breakdown.sections.reduce((sum, section) => sum + section.tokens, 0);
-  const historyTokens = breakdown.history.reduce((sum, item) => sum + item.tokens, 0);
   return {
+    chat: index.conversation.id,
     turn: step.turn,
     step: step.number,
-    inputTokens: breakdown.inputTokens,
-    cacheReadTokens: breakdown.cacheReadTokens,
+    usage: step.call.usage,
     unrecordedTokens: breakdown.unrecordedTokens,
-    toolDefinitions: breakdown.toolDefinitions,
     system: {
-      tokens: systemTokens,
-      sections: breakdown.sections.map((section) => ({ name: section.name, tokens: section.tokens, open: commands.section(ref, section.name) })),
+      tokens: breakdown.sections.reduce((sum, section) => sum + section.tokens, 0),
+      text: breakdown.systemPrompt,
+      sections: breakdown.sections.map((section) => ({ name: section.name, tokens: section.tokens, text: section.text, open: cmd.section(ref, section.name) })),
     },
-    history: {
-      tokens: historyTokens,
-      items: breakdown.history.map((item) => ({ label: item.label, tokens: item.tokens, from: item.ref, open: item.ref ? commands.step(item.ref) : undefined })),
+    tools: breakdown.toolDefinitions,
+    messages: {
+      tokens: breakdown.history.reduce((sum, item) => sum + item.tokens, 0),
+      items: breakdown.history.map((item) => ({
+        number: item.number,
+        role: item.role,
+        label: item.label,
+        tokens: item.tokens,
+        text: item.text,
+        from: item.ref ? cmd.step(item.ref) : undefined,
+        open: cmd.message(ref, item.number),
+      })),
     },
-    sectionTexts: Object.fromEntries(breakdown.sections.map((section) => [section.name, section.text])),
-    open: commands.prompt(ref),
+    open: cmd.prompt(ref),
+    full: cmd.fullPrompt(ref),
+    next: [`${cmd.fullPrompt(ref)}  (all of it, verbatim)`, cmd.section(ref, "NAME"), cmd.message(ref, "N")],
   };
 }
 
-export function renderPrompt(data: NonNullable<ReturnType<typeof promptData>>, full: boolean): string {
-  const total = data.inputTokens ?? data.system.tokens + data.history.tokens;
-  const lines = [`turn ${data.turn} · step ${data.step} · what the model received · ${formatTokens(total)} tokens${cacheShare(data.inputTokens, data.cacheReadTokens)}`, ""];
-  const rows: { tokens: number; lines: string[] }[] = [];
-  if (data.toolDefinitions.captured) {
-    rows.push({ tokens: data.toolDefinitions.tokens, lines: [`tool definitions (${data.toolDefinitions.names.length})`] });
-  }
-  if (data.unrecordedTokens > 0) {
-    const likely = data.toolDefinitions.captured ? "formatting overhead or tokenizer drift" : `likely the ${data.toolDefinitions.names.length} tool definitions`;
-    rows.push({ tokens: data.unrecordedTokens, lines: [`not recorded by the tracer (${likely})`] });
-  }
-  const sections = [...data.system.sections].sort((a, b) => b.tokens - a.tokens);
-  const shownSections = full ? sections : sections.slice(0, 3);
-  rows.push({
-    tokens: data.system.tokens,
-    lines: [
-      `system prompt, ${sections.length} section${sections.length === 1 ? "" : "s"}${full ? ":" : ". Largest:"}`,
-      ...shownSections.map((section) => `  ${formatTokens(section.tokens).padStart(6)}  ${section.name}`),
-    ],
-  });
-  const items = [...data.history.items].sort((a, b) => b.tokens - a.tokens);
-  const shownItems = full ? items : items.slice(0, TOP_ITEMS);
-  const rest = items.length - shownItems.length;
-  const restTokens = items.slice(shownItems.length).reduce((sum, item) => sum + item.tokens, 0);
-  rows.push({
-    tokens: data.history.tokens,
-    lines: [
-      `conversation so far, ${items.length} item${items.length === 1 ? "" : "s"}${full ? ":" : ". Largest:"}`,
-      ...shownItems.map((item) => `  ${formatTokens(item.tokens).padStart(6)}  ${item.label}${item.open ? `  → ${item.open}` : ""}`),
-      ...(rest > 0 ? [`          and ${rest} more (${formatTokens(restTokens)} together)`] : []),
-    ],
-  });
-  for (const row of rows.sort((a, b) => b.tokens - a.tokens)) {
-    const [first, ...others] = row.lines;
-    lines.push(`${formatTokens(row.tokens).padStart(7)}  ${first}`);
-    for (const other of others) lines.push(`         ${other}`);
-  }
-  const biggest = sections[0];
-  const hints = [biggest ? commands.section({ turn: data.turn, step: data.step }, biggest.name).replace(/--section \S+$/, "--section NAME") : undefined, full ? undefined : `${data.open} --full`].filter(Boolean);
-  lines.push("", `next: ${hints.join("  ·  ")}`);
+type PromptData = NonNullable<ReturnType<typeof promptData>>;
+
+function toolsLine(tools: PromptData["tools"]): string {
+  if (tools.captured) return `tool definitions, ${tools.definitions.length}`;
+  if (tools.names.length === 0) return "tools: nothing recorded";
+  return `tools: ${plural(tools.names.length, "name")} recorded, definitions not recorded`;
+}
+
+function promptHeader(data: PromptData, what: string): string[] {
+  return [`chat ${data.chat} · turn ${data.turn} · step ${data.step} · ${what}`, `reported by the provider: ${usageLine(data.usage)}`];
+}
+
+export function renderPrompt(data: PromptData): string {
+  const lines = [...promptHeader(data, "what the model received, in the order it was sent"), "sizes below are estimates (o200k tokenizer)", ""];
+  const row = (tokens: number | undefined, text: string, depth = 0) => {
+    const size = tokens === undefined ? "" : formatTokens(tokens);
+    lines.push(`${" ".repeat(depth * 9)}${size.padStart(7)}  ${text}`);
+  };
+  row(data.system.tokens, `system prompt, ${plural(data.system.sections.length, "section")}`);
+  for (const section of data.system.sections) row(section.tokens, section.name, 1);
+  row(data.tools.captured ? data.tools.tokens : undefined, toolsLine(data.tools));
+  row(data.messages.tokens, plural(data.messages.items.length, "message item"));
+  const numberWidth = String(data.messages.items.length).length;
+  for (const item of data.messages.items) row(item.tokens, `${String(item.number).padStart(numberWidth)}  ${item.label}${item.from ? `  → ${item.from}` : ""}`, 1);
+  if (data.unrecordedTokens > 0) row(data.unrecordedTokens, "reported input tokens not covered by the recorded content");
+  lines.push("", `next: ${data.next.join("  ·  ")}`);
   return lines.join("\n");
+}
+
+export function renderFullPrompt(data: PromptData): string {
+  const lines = [...promptHeader(data, "everything the model received, verbatim, in the order it was sent"), ""];
+  const heading = (text: string) => lines.push(`━━━ ${text}`, "");
+  heading(`system prompt · ~${formatTokens(data.system.tokens)} tokens · ${plural(data.system.sections.length, "section")}`);
+  lines.push(data.system.text, "");
+  heading(toolsLine(data.tools));
+  if (data.tools.captured) {
+    for (const tool of data.tools.definitions) lines.push(tool.name, indent(tool.description), indent(pretty(tool.inputSchema ?? null)), "");
+  } else if (data.tools.names.length > 0) {
+    lines.push(...data.tools.names, "");
+  }
+  for (const item of data.messages.items) {
+    heading(`message item ${item.number} · ${item.role} · ${item.label} · ~${formatTokens(item.tokens)} tokens`);
+    lines.push(item.text, "");
+  }
+  if (data.unrecordedTokens > 0) heading(`~${formatTokens(data.unrecordedTokens)} reported input tokens not covered by the recorded content`);
+  return lines.join("\n").trimEnd();
 }
 
 export interface FindHit {
@@ -387,20 +441,29 @@ function snippet(text: string, needle: string): string {
   return oneLine(`${start > 0 ? "…" : ""}${text.slice(start, at + needle.length + 60)}`, 120);
 }
 
-export function find(conversation: Conversation, index: StepIndex, flags: Flag[], options: { text?: string; errors: boolean }): FindHit[] {
+function errorHits(conversation: Conversation, index: StepIndex, cmd: Commands): FindHit[] {
+  return conversation.turns.flatMap((turn) => {
+    const turnNumber = turn.index + 1;
+    const failed: FindHit[] = index
+      .steps(turnNumber)
+      .flatMap((step) =>
+        step.kind === "tool" && step.tool.status === "error"
+          ? [{ turn: turnNumber, step: step.number, where: `tool ${step.tool.name} failed`, snippet: oneLine(step.tool.error ?? "", 120), open: cmd.step({ turn: turnNumber, step: step.number }) }]
+          : [],
+      );
+    if (failed.length === 0 && turn.status === "error") failed.push({ turn: turnNumber, where: "turn", snippet: "a span in this turn ended with an error status", open: cmd.turn(turnNumber) });
+    return failed;
+  });
+}
+
+export function find(conversation: Conversation, index: StepIndex, options: { text?: string; errors: boolean }, cmd: Commands): FindHit[] {
+  if (options.errors) return errorHits(conversation, index, cmd);
   const hits: FindHit[] = [];
-  if (options.errors) {
-    for (const flag of flags.filter((item) => item.severity === "error")) {
-      const { ref } = flagRef(flag, index);
-      if (ref) hits.push({ turn: ref.turn, step: ref.step, where: flag.id, snippet: flag.message, open: commands.step(ref) });
-    }
-    return hits;
-  }
   const needle = options.text ?? "";
   for (const turn of conversation.turns) {
     const turnNumber = turn.index + 1;
     const user = textOf(turn.userInput);
-    if (user.toLowerCase().includes(needle.toLowerCase())) hits.push({ turn: turnNumber, where: "user", snippet: snippet(user, needle), open: commands.turn(turnNumber) });
+    if (user.toLowerCase().includes(needle.toLowerCase())) hits.push({ turn: turnNumber, where: "user", snippet: snippet(user, needle), open: cmd.turn(turnNumber) });
     for (const step of index.steps(turnNumber)) {
       const ref = { turn: turnNumber, step: step.number };
       const fields =
@@ -414,16 +477,14 @@ export function find(conversation: Conversation, index: StepIndex, flags: Flag[]
               ["model asked for", toolCalls(step).map((call) => `${call.name} ${JSON.stringify(call.input)}`).join("\n")],
             ];
       for (const [where, text] of fields) {
-        if (where && text && text.toLowerCase().includes(needle.toLowerCase())) hits.push({ turn: turnNumber, step: step.number, where, snippet: snippet(text, needle), open: commands.step(ref) });
+        if (where && text && text.toLowerCase().includes(needle.toLowerCase())) hits.push({ turn: turnNumber, step: step.number, where, snippet: snippet(text, needle), open: cmd.step(ref) });
       }
     }
   }
   return hits;
 }
 
-export function renderFind(hits: FindHit[]): string {
-  if (hits.length === 0) return "no matches";
-  return hits
-    .map((hit) => `turn ${hit.turn}${hit.step ? ` step ${hit.step}` : ""}  ${hit.where}\n    ${hit.snippet}\n    → ${hit.open}`)
-    .join("\n");
+export function renderFind(chat: string, hits: FindHit[]): string {
+  const header = `chat ${chat} · ${hits.length === 0 ? "no matches" : `${hits.length} ${hits.length === 1 ? "match" : "matches"}`}`;
+  return [header, ...hits.map((hit) => `turn ${hit.turn}${hit.step ? ` step ${hit.step}` : ""}  ${hit.where}\n    ${hit.snippet}\n    → ${hit.open}`)].join("\n");
 }

@@ -1,10 +1,19 @@
 import { textOf } from "./content.ts";
-import type { Conversation, Message, ModelCall, Part, ToolExecution, Turn } from "./model.ts";
+import type { Conversation, Message, ModelCall, OtherSpan, Part, Role, ToolDefinition, ToolExecution, Turn } from "./model.ts";
 import { countMedia, countText } from "./tokens.ts";
 
+interface StepTiming {
+  turn: number;
+  number: number;
+  startedAt: string;
+  durationMs: number;
+  offsetMs: number;
+  alongside: number[];
+}
+
 export type Step =
-  | { kind: "model"; turn: number; number: number; startedAt: string; durationMs: number; call: ModelCall; callIndex: number }
-  | { kind: "tool"; turn: number; number: number; startedAt: string; durationMs: number; tool: ToolExecution; toolIndex: number };
+  | (StepTiming & { kind: "model"; call: ModelCall; callIndex: number })
+  | (StepTiming & { kind: "tool"; tool: ToolExecution; toolIndex: number });
 
 export interface StepRef {
   turn: number;
@@ -18,7 +27,46 @@ export function stepsOf(turn: Turn): Step[] {
     ...turn.tools.map((tool, toolIndex) => ({ kind: "tool" as const, startedAt: tool.startedAt, durationMs: tool.durationMs, tool, toolIndex })),
   ];
   unordered.sort((a, b) => a.startedAt.localeCompare(b.startedAt) || (a.kind === b.kind ? 0 : a.kind === "model" ? -1 : 1));
-  return unordered.map((step, index) => ({ ...step, turn: turnNumber, number: index + 1 }));
+  const turnStart = Date.parse(turn.startedAt);
+  const timed = unordered.map((step, index) => ({ ...step, turn: turnNumber, number: index + 1, offsetMs: Date.parse(step.startedAt) - turnStart }));
+  return timed.map((step) => ({
+    ...step,
+    alongside: timed
+      .filter((other) => other.number !== step.number && other.offsetMs < step.offsetMs + step.durationMs && step.offsetMs < other.offsetMs + other.durationMs)
+      .map((other) => other.number),
+  }));
+}
+
+export interface TimelineGap {
+  offsetMs: number;
+  durationMs: number;
+  otherSpans: OtherSpan[];
+}
+
+const MIN_GAP_MS = 100;
+
+export function timelineGaps(turn: Turn, steps: Step[]): TimelineGap[] {
+  const turnStart = Date.parse(turn.startedAt);
+  const intervals = steps.map((step) => [step.offsetMs, step.offsetMs + step.durationMs] as const).sort((a, b) => a[0] - b[0]);
+  const covered: [number, number][] = [];
+  for (const [start, end] of intervals) {
+    const last = covered[covered.length - 1];
+    if (last && start <= last[1]) last[1] = Math.max(last[1], end);
+    else covered.push([start, end]);
+  }
+  const bounds = [0, ...covered.flat(), turn.durationMs];
+  const gaps: TimelineGap[] = [];
+  for (let index = 0; index < bounds.length; index += 2) {
+    const start = bounds[index] ?? 0;
+    const end = bounds[index + 1] ?? start;
+    if (end - start < MIN_GAP_MS) continue;
+    const otherSpans = turn.otherSpans.filter((span) => {
+      const offset = Date.parse(span.startedAt) - turnStart;
+      return offset >= start && offset < end;
+    });
+    gaps.push({ offsetMs: start, durationMs: end - start, otherSpans });
+  }
+  return gaps;
 }
 
 function outputText(call: ModelCall): string {
@@ -55,14 +103,6 @@ export class StepIndex {
     return this.steps(turn)[step - 1];
   }
 
-  stepForCall(turn: number, callIndex: number): Step | undefined {
-    return this.steps(turn).find((step) => step.kind === "model" && step.callIndex === callIndex);
-  }
-
-  stepForTool(turn: number, toolIndex: number): Step | undefined {
-    return this.steps(turn).find((step) => step.kind === "tool" && step.toolIndex === toolIndex);
-  }
-
   toolStep(callId: string): Step | undefined {
     return this.byToolCallId.get(callId);
   }
@@ -88,6 +128,8 @@ export interface PromptSection {
 }
 
 export interface PromptItem {
+  number: number;
+  role: Role;
   label: string;
   tokens: number;
   ref?: StepRef;
@@ -97,9 +139,11 @@ export interface PromptItem {
 export interface PromptBreakdown {
   inputTokens?: number;
   cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  systemPrompt: string;
   sections: PromptSection[];
   history: PromptItem[];
-  toolDefinitions: { captured: true; tokens: number; names: string[] } | { captured: false; names: string[] };
+  toolDefinitions: { captured: true; tokens: number; definitions: ToolDefinition[] } | { captured: false; names: string[] };
   unrecordedTokens: number;
 }
 
@@ -119,7 +163,7 @@ function ref(step: Step | undefined): StepRef | undefined {
 }
 
 function historyItems(messages: Message[], index: StepIndex): PromptItem[] {
-  const items: PromptItem[] = [];
+  const items: Omit<PromptItem, "number">[] = [];
   messages.forEach((message, messageIndex) => {
     const number = messageIndex + 1;
     if (message.role === "tool" || message.parts.every((part) => part.kind === "tool_result")) {
@@ -127,7 +171,7 @@ function historyItems(messages: Message[], index: StepIndex): PromptItem[] {
         if (part.kind !== "tool_result") continue;
         const step = index.toolStep(part.callId);
         const name = step?.kind === "tool" ? step.tool.name : "a tool";
-        items.push({ label: `result of ${name}${part.status === "error" ? " (error)" : ""}`, tokens: partTokens(part), ref: ref(step), text: textOf([part]) });
+        items.push({ role: message.role, label: `result of ${name}${part.status === "error" ? " (error)" : ""}`, tokens: partTokens(part), ref: ref(step), text: textOf([part]) });
       }
       return;
     }
@@ -136,10 +180,10 @@ function historyItems(messages: Message[], index: StepIndex): PromptItem[] {
       const turn = index.userTurn(text);
       for (const part of message.parts.filter((item) => item.kind === "media")) {
         const size = part.kind === "media" && part.width ? ` ${part.width}x${part.height}` : "";
-        items.push({ label: `image${size} from ${turn ? `turn ${turn}` : "the user"}`, tokens: partTokens(part), text: textOf([part]) });
+        items.push({ role: message.role, label: `image${size} from ${turn ? `turn ${turn}` : "the user"}`, tokens: partTokens(part), text: textOf([part]) });
       }
       const textTokens = message.parts.filter((part) => part.kind !== "media").reduce((sum, part) => sum + partTokens(part), 0);
-      if (textTokens > 0) items.push({ label: turn ? `user message, turn ${turn}` : `user message ${number}`, tokens: textTokens, text });
+      if (textTokens > 0) items.push({ role: message.role, label: turn ? `user message, turn ${turn}` : `user message ${number}`, tokens: textTokens, text });
       return;
     }
     const tokens = message.parts.reduce((sum, part) => sum + partTokens(part), 0);
@@ -147,9 +191,9 @@ function historyItems(messages: Message[], index: StepIndex): PromptItem[] {
     const call = message.parts.find((part) => part.kind === "tool_call");
     const step = (call && call.kind === "tool_call" ? index.requestingStep(call.id) : undefined) ?? (text ? index.replyStep(text) : undefined);
     const what = call ? "model asked for tools" : "model reply";
-    items.push({ label: step ? what : `${what} (message ${number}, no matching step)`, tokens, ref: ref(step), text: textOf(message.parts) });
+    items.push({ role: message.role, label: step ? what : `${what} (message ${number}, no matching step)`, tokens, ref: ref(step), text: textOf(message.parts) });
   });
-  return items;
+  return items.map((item, position) => ({ ...item, number: position + 1 }));
 }
 
 export function promptBreakdown(call: ModelCall, index: StepIndex): PromptBreakdown | undefined {
@@ -162,7 +206,7 @@ export function promptBreakdown(call: ModelCall, index: StepIndex): PromptBreakd
     ? {
         captured: true as const,
         tokens: context.tools.reduce((sum, tool) => sum + countText(`${tool.name}\n${tool.description}\n${JSON.stringify(tool.inputSchema)}`), 0),
-        names: context.tools.map((tool) => tool.name),
+        definitions: context.tools,
       }
     : { captured: false as const, names: context.tools.names };
   const counted =
@@ -173,6 +217,8 @@ export function promptBreakdown(call: ModelCall, index: StepIndex): PromptBreakd
   return {
     inputTokens: input,
     cacheReadTokens: call.usage?.cacheReadTokens,
+    cacheWriteTokens: call.usage?.cacheWriteTokens,
+    systemPrompt: context.systemPrompt,
     sections,
     history,
     toolDefinitions,
