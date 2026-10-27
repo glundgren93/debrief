@@ -120,6 +120,7 @@ $ debrief examples/demo-trace.jsonl turn 1 --step 5 --prompt --message 5
 {"results":[{"flight_id":"F1000","airline":"TAP","depart":"2026-10-23T06:05","stops":0,"price_eur":212,…
 
 $ debrief examples/demo-trace.jsonl find 149
+chat demo-trace.jsonl · 5 matches
 turn 1 step 4  tool search_flights result
     …", "stops": 0, "price_eur": 149, "fare_rules": "Hand luggage only. Changes allowed fo
     → debrief examples/demo-trace.jsonl turn 1 --step 4
