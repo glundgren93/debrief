@@ -1,4 +1,4 @@
-import { copyFileSync, mkdtempSync } from "node:fs";
+import { copyFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -7,7 +7,7 @@ import { commandsFor, find, promptData, turnData } from "../src/views.ts";
 import { DEFAULT_REDACTIONS, resolveInput } from "../src/config.ts";
 import { parseOtelMessages, parseParts } from "../src/content.ts";
 import { buildConversation, splitSections } from "../src/normalize.ts";
-import { redact } from "../src/sources/index.ts";
+import { load, redact, redactSpans } from "../src/sources/index.ts";
 import { parseSpanRecords, parseSpanText } from "../src/spans.ts";
 import { agentSpan, blocks, chatSpan, span, tinyPng, toolSpan } from "./fixtures.ts";
 
@@ -197,6 +197,45 @@ describe("redaction", () => {
   test("removes JWTs and AWS access keys before anything is cached or printed", () => {
     const jwt = `eyJ${"a".repeat(20)}.${"b".repeat(20)}.${"c".repeat(20)}`;
     expect(redact(`token ${jwt} key AKIAABCDEFGHIJKLMNOP`, DEFAULT_REDACTIONS)).toBe("token [redacted] key [redacted]");
+  });
+
+  test("redacts short-segment JWTs", () => {
+    expect(redact("token eyJx.eA.", DEFAULT_REDACTIONS)).toBe("token [redacted]");
+  });
+
+  test("redacts decoded span and event attribute values", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "debrief-redaction-"));
+    const path = join(dir, "escaped.json");
+    writeFileSync(
+      path,
+      '{"traceId":"t","spanId":"s","name":"chat","startTimeUnixNano":1,"endTimeUnixNano":2,"attributes":{"token":"\\u0041KIAABCDEFGHIJKLMNOP"},"events":[{"name":"event","attributes":{"token":"\\u0041SIAABCDEFGHIJKLMNOP"}}]}',
+    );
+    const loaded = await load(
+      { kind: "file", path, id: "escaped.json" },
+      { files: [], redact: DEFAULT_REDACTIONS, sources: [] },
+      { refresh: false, cacheTtlMs: 0 },
+    );
+    expect(loaded.spans[0]?.attributes.token).toBe("[redacted]");
+    expect(loaded.spans[0]?.events[0]?.attributes.token).toBe("[redacted]");
+  });
+
+  test("redacts strings nested in attribute arrays", () => {
+    const spans = redactSpans(
+      [
+        {
+          traceId: "t",
+          spanId: "s",
+          name: "chat",
+          startNano: 1,
+          endNano: 2,
+          status: "ok",
+          attributes: { tokens: ["AKIAABCDEFGHIJKLMNOP"] },
+          events: [],
+        },
+      ],
+      DEFAULT_REDACTIONS,
+    );
+    expect(spans[0]?.attributes.tokens).toEqual(["[redacted]"]);
   });
 });
 
