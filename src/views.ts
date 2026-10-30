@@ -119,7 +119,8 @@ function hasSeveralAgents(conversation: Conversation): boolean {
 }
 
 function resultValue(parts: Part[] | undefined): unknown {
-  const values = (parts ?? []).map((part) => (part.kind === "data" ? part.value : textOf([part])));
+  if (!parts || parts.length === 0) return undefined;
+  const values = parts.map((part) => (part.kind === "data" ? part.value : textOf([part])));
   return values.length === 1 ? values[0] : values;
 }
 
@@ -171,6 +172,7 @@ export function summaryData(conversation: Conversation, index: StepIndex, cmd: C
         startedAt: turn.startedAt,
         durationMs: turn.durationMs,
         status: turn.status,
+        interruption: turn.interruption,
         steps: steps.length,
         user: textOf(turn.userInput),
         reply: lastReply(steps),
@@ -185,7 +187,7 @@ export function summaryData(conversation: Conversation, index: StepIndex, cmd: C
 export function renderSummary(data: ReturnType<typeof summaryData>, cache?: CacheInfo): string {
   const lines = [headerLine(`chat ${data.chat} · ${data.source} · ${plural(data.turns.length, "turn")} · ${usageLine(data.usage)}`, cache), ""];
   for (const turn of data.turns) {
-    const status = turn.status === "error" ? " · a span ended with an error" : "";
+    const status = turn.status === "error" ? " · a span ended with an error" : turn.status === "interrupted" ? ` · interrupted: ${turn.interruption ?? "unknown"}` : "";
     lines.push(`turn ${turn.turn}  ${turn.startedAt.slice(11, 16)}  ${seconds(turn.durationMs).padStart(7)}  ${plural(turn.steps, "step").padStart(8)}  "${oneLine(turn.user, 70)}"${status}`);
     if (turn.reply) lines.push(`        reply: "${oneLine(turn.reply, 90)}"`);
   }
@@ -199,25 +201,36 @@ export function renderSummary(data: ReturnType<typeof summaryData>, cache?: Cach
 
 function stepHeadline(step: Step, showAgent: boolean): { kind: string; text: string; detail?: string } {
   if (step.kind === "tool") {
-    const status = step.tool.status === "error" ? "  (failed)" : "";
+    const status = step.tool.status === "error" ? "  (failed)" : step.tool.status === "unknown" ? "  (no result recorded)" : "";
     return {
       kind: "tool",
       text: `${step.tool.name}  ${oneLine(step.tool.input ?? "", 110)}${status}`,
-      detail: step.tool.error ? `error: ${oneLine(step.tool.error, 120)}` : `→ ${oneLine(resultValue(step.tool.output), 120)}`,
+      detail: step.tool.error ? `error: ${oneLine(step.tool.error, 120)}` : step.tool.status === "unknown" ? undefined : `→ ${oneLine(resultValue(step.tool.output), 120)}`,
     };
   }
   const agent = showAgent ? ` (${step.call.agent})` : "";
+  const failed = step.call.status === "error";
   const text = said(step);
   const asked = askedFor(step);
   const bits = [text ? `said: "${oneLine(text, 100)}"` : "", asked ? `asked for ${asked}` : ""].filter(Boolean);
-  return { kind: `model${agent}`, text: bits.join("  ·  ") || "(output not recorded)" };
+  return {
+    kind: `model${agent}${failed ? " (failed)" : ""}`,
+    text: bits.join("  ·  ") || "(output not recorded)",
+    detail: step.call.error ? `error: ${oneLine(step.call.error, 120)}` : undefined,
+  };
 }
 
 function spanCounts(spans: OtherSpan[]): string {
   const counts = new Map<string, number>();
   for (const span of spans) counts.set(span.name, (counts.get(span.name) ?? 0) + 1);
+  const failed = new Map<string, number>();
+  for (const span of spans) if (span.status === "error") failed.set(span.name, (failed.get(span.name) ?? 0) + 1);
   const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  const shown = ranked.slice(0, 3).map(([name, count]) => (count > 1 ? `${name} ×${count}` : name));
+  const shown = ranked.slice(0, 3).map(([name, count]) => {
+    const countText = count > 1 ? `${name} ×${count}` : name;
+    const failedCount = failed.get(name) ?? 0;
+    return failedCount > 0 ? `${countText} (${failedCount} failed)` : countText;
+  });
   return `${shown.join(", ")}${ranked.length > 3 ? ", …" : ""}`;
 }
 
@@ -236,6 +249,7 @@ export function turnData(conversation: Conversation, index: StepIndex, turnNumbe
     startedAt: turn.startedAt,
     durationMs: turn.durationMs,
     status: turn.status,
+    interruption: turn.interruption,
     user: textOf(turn.userInput),
     steps: steps.map((step) => {
       const headline = stepHeadline(step, showAgent);
@@ -247,7 +261,8 @@ export function turnData(conversation: Conversation, index: StepIndex, turnNumbe
         alongside: step.alongside,
         summary: headline.text,
         detail: headline.detail,
-        status: step.kind === "tool" ? step.tool.status : "ok",
+        status: step.kind === "tool" ? step.tool.status : step.call.status,
+        error: step.kind === "tool" ? step.tool.error : step.call.error,
         open: cmd.step({ turn: turnNumber, step: step.number }),
         prompt: step.kind === "model" && step.call.context ? cmd.prompt({ turn: turnNumber, step: step.number }) : undefined,
       };
@@ -264,7 +279,7 @@ export function turnData(conversation: Conversation, index: StepIndex, turnNumbe
 }
 
 export function renderTurn(data: ReturnType<typeof turnData>, cache?: CacheInfo): string {
-  const status = data.status === "error" ? " · a span ended with an error" : "";
+  const status = data.status === "error" ? " · a span ended with an error" : data.status === "interrupted" ? ` · interrupted: ${data.interruption ?? "unknown"}` : "";
   const lines = [headerLine(`chat ${data.chat} · turn ${data.turn} of ${data.of} · ${data.startedAt.slice(11, 19)} · ${seconds(data.durationMs)} · ${plural(data.steps.length, "step")}${status}`, cache), "", `user: ${data.user}`, ""];
   const kindWidth = Math.max(9, ...data.steps.map((step) => step.kind.length));
   const detailPad = " ".repeat(3 + 2 + 8 + 2 + 7 + 2 + kindWidth + 2);
@@ -328,6 +343,8 @@ export function stepData(conversation: Conversation, index: StepIndex, step: Ste
     agent: step.call.agent,
     model: step.call.model,
     ...timing,
+    status: step.call.status,
+    error: step.call.error,
     usage: step.call.usage,
     finishReason: step.call.finishReason,
     said: said(step),
@@ -355,18 +372,20 @@ function timingLine(data: { offsetMs: number; durationMs: number; alongside: num
 export function renderStep(data: ReturnType<typeof stepData>, limit: TextLimit, cache?: CacheInfo): string {
   const lines: string[] = [];
   if (data.kind === "tool") {
-    lines.push(headerLine(`chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · tool ${data.tool} · ${data.status === "error" ? "failed" : "ok"}`, cache), timingLine(data), "");
+    const status = data.status === "error" ? "failed" : data.status === "unknown" ? "no result recorded" : "ok";
+    lines.push(headerLine(`chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · tool ${data.tool} · ${status}`, cache), timingLine(data), "");
     lines.push(...block("input", pretty(data.input ?? ""), limit, data.open), "");
-    lines.push(...block(`result (~${formatTokens(data.resultTokens)} tokens)`, data.result || "(not recorded)", limit, data.open));
+    lines.push(...block(`result (~${formatTokens(data.resultTokens)} tokens)`, data.status === "unknown" ? "(no result recorded)" : data.result || "(not recorded)", limit, data.open));
     if (data.error) lines.push("", "error", indent(data.error));
     if (data.askedBy) lines.push("", `next: ${data.askedBy}  (the model step that asked for this)`);
     return lines.join("\n");
   }
   lines.push(
-    headerLine(`chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · model ${data.agent} · ${data.model}`, cache),
+    headerLine(`chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · model ${data.agent} · ${data.model}${data.status === "error" ? " · failed" : ""}`, cache),
     timingLine(data),
     `${usageLine(data.usage)}${data.finishReason ? ` · finished: ${data.finishReason}` : ""}`,
   );
+  if (data.error) lines.push("", "error", indent(data.error));
   if (data.reasoning) lines.push("", ...block("thought", data.reasoning, limit, data.open));
   if (data.said) lines.push("", ...block("said", data.said, limit, data.open));
   if (data.askedFor.length > 0) {
@@ -478,15 +497,13 @@ function snippet(text: string, needle: string): string {
 function errorHits(conversation: Conversation, index: StepIndex, cmd: Commands): FindHit[] {
   return conversation.turns.flatMap((turn) => {
     const turnNumber = turn.index + 1;
-    const failed: FindHit[] = index
-      .steps(turnNumber)
-      .flatMap((step) =>
-        step.kind === "tool" && step.tool.status === "error"
-          ? [{ turn: turnNumber, step: step.number, where: `tool ${step.tool.name} failed`, snippet: oneLine(step.tool.error ?? "", 120), open: cmd.step({ turn: turnNumber, step: step.number }) }]
-          : [],
-      );
-    if (failed.length === 0 && turn.status === "error") failed.push({ turn: turnNumber, where: "turn", snippet: "a span in this turn ended with an error status", open: cmd.turn(turnNumber) });
-    return failed;
+    return turn.errors.map((error) => ({
+      turn: turnNumber,
+      step: error.step,
+      where: `span ${error.name} failed`,
+      snippet: oneLine(error.message ?? "a span ended with an error status", 120),
+      open: error.step ? cmd.step({ turn: turnNumber, step: error.step }) : cmd.turn(turnNumber),
+    }));
   });
 }
 
@@ -505,10 +522,12 @@ export function find(conversation: Conversation, index: StepIndex, options: { te
           ? [
               [`tool ${step.tool.name} input`, pretty(step.tool.input ?? "")],
               [`tool ${step.tool.name} result`, resultText(step.tool.output)],
+              [`tool ${step.tool.name} error`, step.tool.error ?? ""],
             ]
           : [
               ["model said", said(step)],
               ["model asked for", toolCalls(step).map((call) => `${call.name} ${JSON.stringify(call.input)}`).join("\n")],
+              ["model error", step.call.error ?? ""],
             ];
       for (const [where, text] of fields) {
         if (where && text && text.toLowerCase().includes(needle.toLowerCase())) hits.push({ turn: turnNumber, step: step.number, where, snippet: snippet(text, needle), open: cmd.step(ref) });

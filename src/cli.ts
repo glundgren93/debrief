@@ -32,7 +32,7 @@ const HELP = `${BIN}: find out what happened in an AI agent chat
         --section NAME                    one system prompt section, verbatim
         --message N                       one message item, verbatim
   ${BIN} <chat> find TEXT                    steps that mention TEXT
-  ${BIN} <chat> find --errors                failed tool runs and turns with an error status
+  ${BIN} <chat> find --errors                failed spans and their error messages
 
   <chat> is a chat link your config knows about, <source>:<id>, or a trace file.
   Every view names its chat in the first line and ends with the next command to run.

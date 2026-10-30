@@ -43,6 +43,8 @@ export interface ModelCall {
   agent: string;
   model: string;
   startedAt: string;
+  status: "ok" | "error";
+  error?: string;
   durationMs: number;
   timeToFirstTokenMs?: number;
   usage?: Usage;
@@ -57,17 +59,26 @@ export interface ToolExecution {
   name: string;
   startedAt: string;
   durationMs: number;
-  status: "ok" | "error";
+  status: "ok" | "error" | "unknown";
   input?: unknown;
   output?: Part[];
   error?: string;
 }
 
 export interface OtherSpan {
+  spanId: string;
   name: string;
   startedAt: string;
   durationMs: number;
   status: "ok" | "error";
+  error?: string;
+}
+
+export interface SpanError {
+  spanId: string;
+  name: string;
+  message?: string;
+  step?: number;
 }
 
 export interface Turn {
@@ -75,7 +86,9 @@ export interface Turn {
   traceId: string;
   startedAt: string;
   durationMs: number;
-  status: "ok" | "error";
+  status: "ok" | "error" | "interrupted";
+  interruption?: string;
+  errors: SpanError[];
   userInput: Part[];
   calls: ModelCall[];
   tools: ToolExecution[];

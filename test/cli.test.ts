@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { StepIndex, timelineGaps } from "../src/steps.ts";
-import { commandsFor, find, promptData, renderSummary, summaryData, turnData } from "../src/views.ts";
+import { commandsFor, find, promptData, renderStep, renderSummary, renderTurn, stepData, summaryData, turnData } from "../src/views.ts";
 import { DEFAULT_REDACTIONS, resolveInput } from "../src/config.ts";
 import { parseOtelMessages, parseParts } from "../src/content.ts";
 import { buildConversation, splitSections } from "../src/normalize.ts";
@@ -171,6 +171,44 @@ describe("conversation model", () => {
     const conversation = buildConversation("c", "test", [agent, call]);
     expect(conversation.turns[0]?.calls[0]?.usage?.inputTokens).toBe(1000);
   });
+
+  test("records failed model calls and excludes their missing usage from capture gaps", () => {
+    const agent = agentSpan("t", "q");
+    const failed = span({
+      traceId: "t",
+      parent: agent,
+      name: "chat",
+      status: "error",
+      statusMessage: "Model access is denied",
+      attributes: { "gen_ai.operation.name": "chat", "gen_ai.request.model": "model-x" },
+      events: [{ name: "gen_ai.user.message", attributes: { content: blocks({ text: "q" }) } }],
+    });
+    const conversation = buildConversation("c", "test", [agent, failed]);
+    expect(conversation.turns[0]?.calls[0]).toMatchObject({ status: "error", error: "Model access is denied" });
+    expect(conversation.turns[0]?.status).toBe("error");
+    expect(conversation.gaps.some((gap) => gap.what.includes("token usage"))).toBe(false);
+  });
+
+  test("uses exception messages and lists each failed span once", () => {
+    const agent = agentSpan("t", "q");
+    const failed = span({
+      traceId: "t",
+      parent: agent,
+      name: "tool.dispatch",
+      status: "error",
+      events: [{ name: "exception", attributes: { "exception.message": "connector_not_enabled" } }],
+    });
+    const conversation = buildConversation("c", "test", [agent, failed]);
+    const hits = find(conversation, new StepIndex(conversation), { errors: true }, commandsFor("c"));
+    expect(hits).toEqual([expect.objectContaining({ where: "span tool.dispatch failed", snippet: "connector_not_enabled", open: "debrief c turn 1" })]);
+  });
+
+  test("uses the first result line for a tool error without a status message", () => {
+    const agent = agentSpan("t", "q");
+    const failed = toolSpan("t", agent, "fetch", { id: 1 }, "Client error: status 404\nnot found", "error");
+    const conversation = buildConversation("c", "test", [agent, failed]);
+    expect(conversation.turns[0]?.tools[0]?.error).toBe("Client error: status 404");
+  });
 });
 
 describe("input resolution", () => {
@@ -269,6 +307,64 @@ describe("steps", () => {
     const index = new StepIndex(conversation);
     const hits = find(conversation, index, { errors: true }, commandsFor("c"));
     expect(hits.map((hit) => hit.open)).toEqual(["debrief c turn 1 --step 4"]);
+  });
+
+  test("searches model and tool error text", () => {
+    const agent = agentSpan("t", "q");
+    const failedModel = span({
+      traceId: "t",
+      parent: agent,
+      name: "chat",
+      status: "error",
+      statusMessage: "stream ended unexpectedly",
+      attributes: { "gen_ai.operation.name": "chat" },
+      events: [{ name: "gen_ai.user.message", attributes: { content: blocks({ text: "q" }) } }],
+    });
+    const conversation = buildConversation("c", "test", [agent, failedModel]);
+    const hits = find(conversation, new StepIndex(conversation), { text: "unexpected", errors: false }, commandsFor("c"));
+    expect(hits).toEqual([expect.objectContaining({ where: "model error", step: 1 })]);
+  });
+
+  test("renders failed model steps with status and error in both views", () => {
+    const agent = agentSpan("t", "q");
+    const failedModel = span({
+      traceId: "t",
+      parent: agent,
+      name: "chat",
+      status: "error",
+      statusMessage: "stream ended unexpectedly",
+      attributes: { "gen_ai.operation.name": "chat" },
+      events: [{ name: "gen_ai.user.message", attributes: { content: blocks({ text: "q" }) } }],
+    });
+    const conversation = buildConversation("c", "test", [agent, failedModel]);
+    const index = new StepIndex(conversation);
+    const step = index.step(1, 1);
+    if (!step) throw new Error("expected failed model step");
+    const data = stepData(conversation, index, step, commandsFor("c"));
+    expect(data).toMatchObject({ status: "error", error: "stream ended unexpectedly" });
+    expect(renderStep(data, {})).toContain("error");
+    expect(renderTurn(turnData(conversation, index, 1, commandsFor("c")))).toContain("model (failed)");
+  });
+
+  test("marks errored gap spans in grouped timeline counts", () => {
+    const agent = agentSpan("t", "q");
+    const call = chatSpan("t", agent, [{ role: "user", content: blocks({ text: "q" }) }], blocks({ text: "a" }), { input: 1 });
+    const gets = [0, 1, 2, 3].map((index) => span({ traceId: "t", parent: agent, name: "GET", gapMs: index === 0 ? 1100 : 10, status: index === 0 ? "error" : "ok", statusMessage: index === 0 ? "upstream failed" : undefined }));
+    const conversation = buildConversation("c", "test", [agent, call, ...gets]);
+    expect(renderTurn(turnData(conversation, new StepIndex(conversation), 1, commandsFor("c")))).toContain("GET ×4 (1 failed)");
+  });
+
+  test("labels interrupted turns and pending tools without results", () => {
+    const agent = agentSpan("t", "q");
+    const interrupt = span({ traceId: "t", parent: agent, name: "execute_agent_loop_cycle", status: "error", statusMessage: "Interrupt raised: approval" });
+    const pending = { ...span({ traceId: "t", parent: interrupt, name: "execute_tool fetch" }), status: "unset" as const };
+    const conversation = buildConversation("c", "test", [agent, interrupt, pending]);
+    expect(conversation.turns[0]).toMatchObject({ status: "interrupted", interruption: "approval" });
+    expect(conversation.turns[0]?.tools[0]?.status).toBe("unknown");
+    const index = new StepIndex(conversation);
+    expect(renderTurn(turnData(conversation, index, 1, commandsFor("c")))).toContain("interrupted: approval");
+    expect(renderTurn(turnData(conversation, index, 1, commandsFor("c")))).toContain("no result recorded");
+    expect(find(conversation, index, { errors: true }, commandsFor("c"))).toEqual([]);
   });
 });
 

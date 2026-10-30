@@ -21,6 +21,7 @@ interface SpanInput {
   attributes?: Record<string, string | number>;
   events?: { name: string; attributes: Record<string, string> }[];
   status?: "ok" | "error";
+  statusMessage?: string;
   gapMs?: number;
 }
 
@@ -36,6 +37,7 @@ export function span(input: SpanInput): Span {
     startNano: start,
     endNano: end,
     status: input.status ?? "ok",
+    statusMessage: input.statusMessage,
     attributes: { "session.id": "conv-1", ...(input.attributes ?? {}) },
     events: (input.events ?? []).map((event) => ({ name: event.name, timeUnixNano: start, attributes: event.attributes })),
   };
