@@ -46,7 +46,27 @@ describe("source cache", () => {
     chmodSync(fresh, 0o644);
     const old = new Date(Date.now() - 2_000);
     utimesSync(expired, old, old);
-    const input = join(directory, "input.jsonl");
+    const source = { name: "app", type: "cloudwatch-spans" as const, region: "eu-west-1" };
+    writeFileSync(cachePath(source, "chat-1"), JSON.stringify({ fetchedAt: Date.now(), warnings: [], spans: "" }));
+
+    const loaded = await load(
+      { kind: "source", source, id: "chat-1" },
+      { sources: [source], redact: [], files: [] },
+      { refresh: false, cacheTtlMs: 1_000 },
+    );
+
+    expect(loaded.fromCache).toBe(true);
+
+    expect(existsSync(expired)).toBe(false);
+    expect(statSync(directory).mode & 0o777).toBe(0o700);
+    expect(statSync(fresh).mode & 0o777).toBe(0o600);
+  });
+
+  test("reading a local file leaves the cache directory untouched", async () => {
+    const parent = mkdtempSync(join(tmpdir(), "debrief-cache-file-"));
+    const directory = join(parent, "cache");
+    process.env.DEBRIEF_CACHE_DIR = directory;
+    const input = join(parent, "input.jsonl");
     writeFileSync(input, "");
 
     await load(
@@ -55,9 +75,6 @@ describe("source cache", () => {
       { refresh: false, cacheTtlMs: 1_000 },
     );
 
-    expect(existsSync(expired)).toBe(false);
-    expect(statSync(directory).mode & 0o777).toBe(0o700);
-    expect(statSync(fresh).mode & 0o777).toBe(0o600);
-    expect(statSync(input).mode & 0o777).toBe(0o600);
+    expect(existsSync(directory)).toBe(false);
   });
 });

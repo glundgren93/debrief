@@ -115,11 +115,11 @@ function parseCachedSpans(text: string, patterns: string[]): Span[] {
 }
 
 export async function load(resolved: ResolvedInput, config: Config, options: LoadOptions): Promise<Loaded> {
-  prepareCache(options.cacheTtlMs);
   if (resolved.kind === "file") {
     const text = redact(readFileSync(resolved.path, "utf8"), config.redact);
     return { spans: parseAndRedact(text, config.redact), sourceName: "file", warnings: [], fromCache: false };
   }
+  prepareCache(options.cacheTtlMs);
   const path = cachePath(resolved.source, resolved.id);
   if (!options.refresh && existsSync(path)) {
     const cached = readCache(path);
