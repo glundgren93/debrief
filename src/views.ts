@@ -5,6 +5,9 @@ import { countText } from "./tokens.ts";
 
 export const BIN = "debrief";
 
+const NO_USER_MESSAGE = "(no user message recorded)";
+const NO_REPLY = "no reply";
+
 export function formatTokens(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(2)}M`;
   if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k`;
@@ -142,9 +145,15 @@ function askedFor(step: Extract<Step, { kind: "model" }>): string {
   return [...counts.entries()].map(([name, count]) => (count > 1 ? `${name} ×${count}` : name)).join(", ");
 }
 
-function lastReply(steps: Step[]): string {
-  for (const step of [...steps].reverse()) if (step.kind === "model" && said(step)) return said(step);
-  return "";
+function lastReply(steps: Step[], primaryAgent: string | undefined): string {
+  for (const step of [...steps].reverse()) {
+    if (step.kind === "model" && step.call.agent === primaryAgent && said(step)) return said(step);
+  }
+  return NO_REPLY;
+}
+
+function userText(parts: Part[]): string {
+  return parts.length > 0 ? textOf(parts) : NO_USER_MESSAGE;
 }
 
 function sumUsage(conversation: Conversation): Usage {
@@ -174,8 +183,8 @@ export function summaryData(conversation: Conversation, index: StepIndex, cmd: C
         status: turn.status,
         interruption: turn.interruption,
         steps: steps.length,
-        user: textOf(turn.userInput),
-        reply: lastReply(steps),
+        user: userText(turn.userInput),
+        reply: lastReply(steps, turn.primaryAgent),
         open: cmd.turn(turn.index + 1),
       };
     }),
@@ -250,7 +259,7 @@ export function turnData(conversation: Conversation, index: StepIndex, turnNumbe
     durationMs: turn.durationMs,
     status: turn.status,
     interruption: turn.interruption,
-    user: textOf(turn.userInput),
+    user: userText(turn.userInput),
     steps: steps.map((step) => {
       const headline = stepHeadline(step, showAgent);
       return {
@@ -513,7 +522,7 @@ export function find(conversation: Conversation, index: StepIndex, options: { te
   const needle = options.text ?? "";
   for (const turn of conversation.turns) {
     const turnNumber = turn.index + 1;
-    const user = textOf(turn.userInput);
+    const user = userText(turn.userInput);
     if (user.toLowerCase().includes(needle.toLowerCase())) hits.push({ turn: turnNumber, where: "user", snippet: snippet(user, needle), open: cmd.turn(turnNumber) });
     for (const step of index.steps(turnNumber)) {
       const ref = { turn: turnNumber, step: step.number };

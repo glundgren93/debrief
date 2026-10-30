@@ -385,6 +385,40 @@ function parallelTurn() {
   return buildConversation("c", "test", [root, setup, fetch, titleAgent, mainAgent, title, main, persist]);
 }
 
+function primaryWithoutReplyTurn() {
+  const root = span({ traceId: "t", name: "agent_streaming", durationMs: 6000 });
+  const origin = root.startNano;
+  const titleAgent = { ...at(agentSpan("t", "hi", { "gen_ai.agent.id": "title-agent" }), 750, 900, origin), parentSpanId: root.spanId };
+  const mainAgent = { ...at(agentSpan("t", "hi"), 760, 4800, origin), parentSpanId: root.spanId };
+  const title = at(chatSpan("t", titleAgent, [{ role: "system", content: blocks({ text: "Title it." }) }, { role: "user", content: blocks({ text: "hi" }) }], blocks({ text: "General Chat" }), { input: 40 }), 760, 890, origin);
+  const main = at(chatSpan("t", mainAgent, [{ role: "system", content: blocks({ text: "Help." }) }, { role: "user", content: blocks({ text: "hi" }) }], blocks({ text: "" }), { input: 500 }), 770, 4800, origin);
+  return buildConversation("c", "test", [root, titleAgent, mainAgent, title, main]);
+}
+
+function resumedTurnWithoutUserMessage() {
+  const agent = agentSpan("t", undefined);
+  const call = chatSpan("t", agent, [{ role: "system", content: blocks({ text: "Help." }) }, { role: "user", content: blocks({ text: "old user message" }) }], blocks({ text: "continued" }), { input: 10 });
+  return buildConversation("c", "test", [agent, call]);
+}
+
+describe("turn summary attribution", () => {
+  test("takes the reply only from the primary agent and reports no reply when it wrote nothing", () => {
+    const conversation = primaryWithoutReplyTurn();
+    const data = summaryData(conversation, new StepIndex(conversation), commandsFor("c"));
+    expect(data.turns[0]).toMatchObject({ user: "hi", reply: "no reply" });
+  });
+
+  test("does not reuse a prior history user message when the primary agent has no user event", () => {
+    const conversation = resumedTurnWithoutUserMessage();
+    const index = new StepIndex(conversation);
+    const summary = summaryData(conversation, index, commandsFor("c"));
+    const turn = turnData(conversation, index, 1, commandsFor("c"));
+    expect(conversation.turns[0]?.userInput).toEqual([]);
+    expect(summary.turns[0]?.user).toBe("(no user message recorded)");
+    expect(turn.user).toBe(summary.turns[0]!.user);
+  });
+});
+
 describe("timeline", () => {
   test("says which steps ran at the same time instead of implying they ran one after another", () => {
     const index = new StepIndex(parallelTurn());
@@ -551,5 +585,23 @@ describe("naming the chat", () => {
 
   test("quotes chat links with shell characters in next commands", () => {
     expect(commandsFor("https://app.example.com/chat/abc?x=1&y=2").turn(1)).toBe("debrief 'https://app.example.com/chat/abc?x=1&y=2' turn 1");
+  });
+
+  test("keeps missing user and reply placeholders in JSON views", () => {
+    const { dir, run } = setup();
+    const agent = agentSpan("t", undefined);
+    const call = chatSpan("t", agent, [{ role: "system", content: blocks({ text: "Help." }) }, { role: "user", content: blocks({ text: "old user message" }) }], blocks({ text: "continued" }), { input: 10 });
+    const trace = join(dir, "resumed.jsonl");
+    writeFileSync(
+      trace,
+      [agent, call]
+        .map((item) => JSON.stringify({ ...item, startTimeUnixNano: item.startNano, endTimeUnixNano: item.endNano }))
+        .join("\n"),
+    );
+
+    const summary = JSON.parse(run([trace, "--json"]).out) as { turns: { user: string; reply: string }[] };
+    const turn = JSON.parse(run([trace, "turn", "1", "--json"]).out) as { user: string };
+    expect(summary.turns[0]).toMatchObject({ user: "(no user message recorded)", reply: "continued" });
+    expect(turn.user).toBe(summary.turns[0]!.user);
   });
 });

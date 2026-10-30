@@ -225,7 +225,11 @@ function primaryAgent(agents: Span[]): Span | undefined {
   return [...agents].sort((a, b) => durationMs(b) - durationMs(a))[0];
 }
 
-function userInputOf(agent: Span | undefined, calls: ModelCall[]): Part[] {
+function agentName(agent: Span | undefined): string | undefined {
+  return agent ? stringAttr(agent.attributes, "gen_ai.agent.id", "gen_ai.agent.name") ?? "agent" : undefined;
+}
+
+function userInputOf(agent: Span | undefined): Part[] {
   if (agent) {
     const event = agent.events.find((item) => item.name === "gen_ai.user.message");
     if (event) return parseParts(event.attributes.content ?? "");
@@ -236,9 +240,7 @@ function userInputOf(agent: Span | undefined, calls: ModelCall[]): Part[] {
       if (last) return last.parts;
     }
   }
-  const messages = calls[0]?.context?.messages ?? [];
-  const lastUser = [...messages].reverse().find((message) => message.role === "user" && message.parts.some((part) => part.kind === "text"));
-  return lastUser?.parts ?? [];
+  return [];
 }
 
 function spanLabel(span: Span): string {
@@ -308,7 +310,7 @@ function buildTurn(traceId: string, spans: Span[], index: number): Turn {
     const ttftSeconds = numberAttr(span.attributes, "gen_ai.server.time_to_first_token");
     return {
       spanId: span.spanId,
-      agent: (agent && stringAttr(agent.attributes, "gen_ai.agent.id", "gen_ai.agent.name")) ?? "agent",
+      agent: agentName(agent) ?? "agent",
       model: stringAttr(span.attributes, "gen_ai.request.model", "gen_ai.response.model") ?? (agent && stringAttr(agent.attributes, "gen_ai.request.model")) ?? "unknown",
       startedAt: isoTime(span.startNano),
       durationMs: durationMs(span),
@@ -338,7 +340,8 @@ function buildTurn(traceId: string, spans: Span[], index: number): Turn {
     status: interruption ? "interrupted" : errors.length > 0 ? "error" : "ok",
     interruption,
     errors,
-    userInput: userInputOf(agent, calls),
+    primaryAgent: agentName(agent),
+    userInput: userInputOf(agent),
     calls,
     tools,
     otherSpans: otherSpansOf(spans, [...chatSpans, ...toolSpans], byId),

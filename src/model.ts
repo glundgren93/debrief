@@ -89,6 +89,7 @@ export interface Turn {
   status: "ok" | "error" | "interrupted";
   interruption?: string;
   errors: SpanError[];
+  primaryAgent?: string;
   userInput: Part[];
   calls: ModelCall[];
   tools: ToolExecution[];

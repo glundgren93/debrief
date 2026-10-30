@@ -47,7 +47,7 @@ export function blocks(...items: unknown[]): string {
   return JSON.stringify(items);
 }
 
-export function agentSpan(traceId: string, userText: string, extra: Record<string, string | number> = {}): Span {
+export function agentSpan(traceId: string, userText: string | undefined, extra: Record<string, string | number> = {}): Span {
   return span({
     traceId,
     name: "invoke_agent Strands Agent",
@@ -59,7 +59,7 @@ export function agentSpan(traceId: string, userText: string, extra: Record<strin
       "gen_ai.agent.tools": JSON.stringify(["search", "fetch"]),
       ...extra,
     },
-    events: [{ name: "gen_ai.user.message", attributes: { content: blocks({ text: userText }) } }],
+    events: userText === undefined ? [] : [{ name: "gen_ai.user.message", attributes: { content: blocks({ text: userText }) } }],
   });
 }
 
