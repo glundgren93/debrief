@@ -1,5 +1,5 @@
 import { parseOtelMessages, parseParts, textOf } from "./content.ts";
-import type { CaptureGap, Context, Conversation, Message, ModelCall, OtherSpan, Part, Role, Section, ToolDefinition, ToolExecution, Turn, Usage } from "./model.ts";
+import type { CaptureGap, Context, Conversation, Message, ModelCall, OtherSpan, Part, Role, Section, SpanError, ToolDefinition, ToolExecution, Turn, Usage } from "./model.ts";
 import { numberAttr, type Span, stringAttr } from "./spans.ts";
 
 const MESSAGE_EVENT_ROLES: Record<string, Role> = {
@@ -170,10 +170,32 @@ function findAncestor(span: Span, byId: Map<string, Span>, predicate: (span: Spa
   return undefined;
 }
 
+function spanError(span: Span): string | undefined {
+  if (span.statusMessage) return span.statusMessage;
+  for (const event of span.events) {
+    if (!event.name.toLowerCase().includes("exception")) continue;
+    const message = stringAttr(event.attributes, "exception.message", "message", "exception.stacktrace");
+    if (message) return message.split("\n", 1)[0];
+  }
+  return undefined;
+}
+
+function interruptName(span: Span): string | undefined {
+  const message = span.statusMessage;
+  if (!message) return undefined;
+  const match = message.match(/^Interrupt raised:\s*(.+)$/);
+  return match?.[1];
+}
+
+function firstResultLine(parts: Part[] | undefined): string | undefined {
+  if (!parts || parts.length === 0) return undefined;
+  const text = parts.length === 1 && parts[0]?.kind === "data" && typeof parts[0].value === "string" ? parts[0].value.trim() : textOf(parts).trim();
+  return text ? text.split("\n", 1)[0] : undefined;
+}
+
 function toolExecution(span: Span): ToolExecution {
   const a = span.attributes;
   const toolStatus = stringAttr(a, "gen_ai.tool.status");
-  const failed = span.status === "error" || (toolStatus !== undefined && toolStatus !== "success");
   let input: unknown = stringAttr(a, "gen_ai.tool.call.arguments");
   let output: Part[] | undefined;
   const result = stringAttr(a, "gen_ai.tool.call.result");
@@ -183,16 +205,19 @@ function toolExecution(span: Span): ToolExecution {
     if (event.name === "gen_ai.choice") output = parseParts(event.attributes.message ?? event.attributes.content ?? "");
   }
   if (input && typeof input === "object" && "kind" in input && (input as Part).kind === "data") input = (input as unknown as { value: unknown }).value;
+  const failed = span.status === "error" || (toolStatus !== undefined && toolStatus !== "success");
+  const error = failed ? spanError(span) ?? firstResultLine(output) ?? (toolStatus !== "success" ? toolStatus : undefined) : undefined;
+  const status = failed ? "error" : toolStatus === undefined && output === undefined ? "unknown" : "ok";
   return {
     spanId: span.spanId,
     callId: stringAttr(a, "gen_ai.tool.call.id"),
     name: stringAttr(a, "gen_ai.tool.name") ?? span.name.replace(/^execute_tool\s*/, ""),
     startedAt: isoTime(span.startNano),
     durationMs: durationMs(span),
-    status: failed ? "error" : "ok",
+    status,
     input,
     output,
-    error: failed ? span.statusMessage ?? toolStatus : undefined,
+    error,
   };
 }
 
@@ -243,11 +268,29 @@ function otherSpansOf(spans: Span[], stepSpans: Span[], byId: Map<string, Span>)
     .filter((span) => operation(span) === undefined && !containers.has(span.spanId))
     .sort((a, b) => a.startNano - b.startNano)
     .map((span) => ({
+      spanId: span.spanId,
       name: spanLabel(span),
       startedAt: isoTime(span.startNano),
       durationMs: durationMs(span),
       status: span.status === "error" ? "error" : "ok",
+      error: span.status === "error" ? spanError(span) : undefined,
     }));
+}
+
+function spanErrors(spans: Span[], calls: ModelCall[], tools: ToolExecution[], byId: Map<string, Span>): SpanError[] {
+  const stepBySpanId = new Map<string, number>();
+  const toolBySpanId = new Map(tools.map((tool) => [tool.spanId, tool]));
+  [...calls, ...tools]
+    .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
+    .forEach((step, index) => stepBySpanId.set(step.spanId, index + 1));
+  return spans.flatMap((span) => {
+    const toolStatus = stringAttr(span.attributes, "gen_ai.tool.status");
+    const failed = span.status === "error" || (toolStatus !== undefined && toolStatus !== "success");
+    if (!failed || interruptName(span)) return [];
+    const step = stepBySpanId.get(span.spanId) ?? findAncestor(span, byId, (candidate) => stepBySpanId.has(candidate.spanId));
+    const stepNumber = typeof step === "number" ? step : step ? stepBySpanId.get(step.spanId) : undefined;
+    return [{ spanId: span.spanId, name: spanLabel(span), message: toolBySpanId.get(span.spanId)?.error ?? spanError(span), step: stepNumber }];
+  });
 }
 
 function buildTurn(traceId: string, spans: Span[], index: number): Turn {
@@ -255,7 +298,9 @@ function buildTurn(traceId: string, spans: Span[], index: number): Turn {
   const agents = spans.filter((span) => operation(span) === "invoke_agent");
   const chatSpans = spans.filter((span) => operation(span) === "chat");
   const withContent = chatSpans.filter(hasContent);
-  const callSpans = (withContent.length > 0 ? withContent : chatSpans).sort((a, b) => a.startNano - b.startNano);
+  const callSpans = [...new Map((withContent.length > 0 ? [...withContent, ...chatSpans.filter((span) => span.status === "error")] : chatSpans).map((span) => [span.spanId, span])).values()].sort(
+    (a, b) => a.startNano - b.startNano,
+  );
 
   const calls: ModelCall[] = callSpans.map((span) => {
     const agent = findAncestor(span, byId, (candidate) => operation(candidate) === "invoke_agent");
@@ -267,6 +312,8 @@ function buildTurn(traceId: string, spans: Span[], index: number): Turn {
       model: stringAttr(span.attributes, "gen_ai.request.model", "gen_ai.response.model") ?? (agent && stringAttr(agent.attributes, "gen_ai.request.model")) ?? "unknown",
       startedAt: isoTime(span.startNano),
       durationMs: durationMs(span),
+      status: span.status === "error" ? "error" : "ok",
+      error: span.status === "error" ? spanError(span) : undefined,
       timeToFirstTokenMs: ttftSeconds === undefined ? undefined : Math.round(ttftSeconds * 1000),
       usage: usageOf(span),
       context: content?.context,
@@ -281,13 +328,16 @@ function buildTurn(traceId: string, spans: Span[], index: number): Turn {
   const start = Math.min(...spans.map((span) => span.startNano));
   const end = Math.max(...spans.map((span) => span.endNano));
   const agent = primaryAgent(agents);
-  const failed = spans.some((span) => span.status === "error" && (operation(span) !== undefined || !span.parentSpanId));
+  const interruption = spans.map(interruptName).find((name): name is string => name !== undefined);
+  const errors = spanErrors(spans, calls, tools, byId);
   return {
     index,
     traceId,
     startedAt: isoTime(start),
     durationMs: Math.round((end - start) / 1e6),
-    status: failed ? "error" : "ok",
+    status: interruption ? "interrupted" : errors.length > 0 ? "error" : "ok",
+    interruption,
+    errors,
     userInput: userInputOf(agent, calls),
     calls,
     tools,
@@ -314,7 +364,7 @@ function captureGaps(turns: Turn[]): CaptureGap[] {
       howToEnable: "Record gen_ai.tool.definitions on the agent or model-call span. Some SDKs need an opt-in, some do not emit it yet.",
     });
   }
-  if (calls.some((call) => !call.usage)) gaps.push({ what: "Some model calls have no token usage (gen_ai.usage.*)." });
+  if (calls.some((call) => !call.usage && call.status !== "error")) gaps.push({ what: "Some model calls have no token usage (gen_ai.usage.*)." });
   return gaps;
 }
 
