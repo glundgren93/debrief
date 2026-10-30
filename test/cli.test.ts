@@ -3,11 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { StepIndex, timelineGaps } from "../src/steps.ts";
-import { commandsFor, find, promptData, turnData } from "../src/views.ts";
+import { commandsFor, find, promptData, renderSummary, summaryData, turnData } from "../src/views.ts";
 import { DEFAULT_REDACTIONS, resolveInput } from "../src/config.ts";
 import { parseOtelMessages, parseParts } from "../src/content.ts";
 import { buildConversation, splitSections } from "../src/normalize.ts";
-import { load, redact, redactSpans } from "../src/sources/index.ts";
+import { cachePath, load, redact, redactSpans } from "../src/sources/index.ts";
 import { parseSpanRecords, parseSpanText } from "../src/spans.ts";
 import { agentSpan, blocks, chatSpan, span, tinyPng, toolSpan } from "./fixtures.ts";
 
@@ -343,6 +343,69 @@ describe("prompt contents", () => {
     expect(prompt?.system.text).toBe("<role>\nHelp.\n</role>\n\n<rules>\nBe brief.\n</rules>");
     expect(prompt?.system.sections.map((section) => section.name)).toEqual(["role", "rules"]);
     expect(prompt?.usage).toMatchObject({ cacheWriteTokens: 480 });
+  });
+
+  test("numbers message labels after tool results are split into items", () => {
+    const agent = agentSpan("labels", "first");
+    const call = chatSpan(
+      "labels",
+      agent,
+      [
+        { role: "user", content: blocks({ text: "first" }) },
+        { role: "tool", content: blocks({ toolResult: { toolUseId: "missing-1", content: [{ json: { first: true } }] } }, { toolResult: { toolUseId: "missing-2", content: [{ json: { second: true } }] } }) },
+        { role: "user", content: blocks({ text: "later" }) },
+        { role: "assistant", content: blocks({ text: "unmatched" }) },
+      ],
+      blocks({ text: "answer" }),
+      { input: 10 },
+    );
+    const conversation = buildConversation("labels", "test", [agent, call]);
+    const index = new StepIndex(conversation);
+    const step = index.step(1, 1);
+    if (step?.kind !== "model") throw new Error("expected a model step");
+    const prompt = promptData(index, step, commandsFor("c"));
+    expect(prompt?.messages.items.map((item) => item.label)).toEqual([
+      "user message, turn 1",
+      "result of a tool",
+      "result of a tool",
+      "user message 4",
+      "model reply (message 5, no matching step)",
+    ]);
+  });
+});
+
+describe("cached source metadata", () => {
+  test("returns cached warnings and the fetch time", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "debrief-cache-test-"));
+    const previous = process.env.DEBRIEF_CACHE_DIR;
+    process.env.DEBRIEF_CACHE_DIR = dir;
+    try {
+      const source = { name: "app", type: "cloudwatch-spans" as const, region: "eu-west-1" };
+      const id = "chat-1";
+      const fetchedAt = Date.now() - 1000;
+      const spans = JSON.stringify({ traceId: "trace", spanId: "span", name: "root", startTimeUnixNano: 1, endTimeUnixNano: 2 });
+      writeFileSync(cachePath(source, id), JSON.stringify({ fetchedAt, warnings: ["later turns may be missing"], spans }));
+      const loaded = await load(
+        { kind: "source", source, id },
+        { sources: [source], redact: [], files: [] },
+        { refresh: false, cacheTtlMs: 24 * 3600 * 1000 },
+      );
+      expect(loaded.fromCache).toBe(true);
+      expect(loaded.warnings).toEqual(["later turns may be missing"]);
+      expect(loaded.fetchedAt).toBe(fetchedAt);
+      expect(loaded.spans).toHaveLength(1);
+    } finally {
+      if (previous === undefined) delete process.env.DEBRIEF_CACHE_DIR;
+      else process.env.DEBRIEF_CACHE_DIR = previous;
+    }
+  });
+
+  test("marks cached output in text and JSON view data", () => {
+    const conversation = sampleConversation();
+    const cache = { fromCache: true, fetchedAt: Date.now() - 125_000 };
+    const data = summaryData(conversation, new StepIndex(conversation), commandsFor("c"), cache);
+    expect(data.fromCache).toBe(true);
+    expect(renderSummary(data, cache).split("\n")[0]).toContain("cached 2m ago · --refresh to fetch again");
   });
 });
 
