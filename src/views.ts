@@ -45,6 +45,35 @@ export interface TextLimit {
   maxChars?: number;
 }
 
+export interface CacheInfo {
+  fromCache: boolean;
+  fetchedAt?: number;
+}
+
+function cacheFields(cache?: CacheInfo): { fromCache: boolean } {
+  return { fromCache: cache?.fromCache ?? false };
+}
+
+function cacheAge(ageMs: number): string {
+  const seconds = Math.floor(ageMs / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+function cacheLabel(cache?: CacheInfo): string {
+  if (!cache?.fromCache || cache.fetchedAt === undefined) return "";
+  return `cached ${cacheAge(Math.max(0, Date.now() - cache.fetchedAt))} ago · --refresh to fetch again`;
+}
+
+function headerLine(line: string, cache?: CacheInfo): string {
+  const label = cacheLabel(cache);
+  return label ? `${line} · ${label}` : line;
+}
+
 function clip(text: string, limit: TextLimit): { text: string; truncated: boolean } {
   if (limit.maxChars === undefined || text.length <= limit.maxChars) return { text, truncated: false };
   return { text: text.slice(0, limit.maxChars), truncated: true };
@@ -129,8 +158,9 @@ function sumUsage(conversation: Conversation): Usage {
   };
 }
 
-export function summaryData(conversation: Conversation, index: StepIndex, cmd: Commands) {
+export function summaryData(conversation: Conversation, index: StepIndex, cmd: Commands, cache?: CacheInfo) {
   return {
+    ...cacheFields(cache),
     chat: conversation.id,
     source: conversation.source,
     usage: sumUsage(conversation),
@@ -152,8 +182,8 @@ export function summaryData(conversation: Conversation, index: StepIndex, cmd: C
   };
 }
 
-export function renderSummary(data: ReturnType<typeof summaryData>): string {
-  const lines = [`chat ${data.chat} · ${data.source} · ${plural(data.turns.length, "turn")} · ${usageLine(data.usage)}`, ""];
+export function renderSummary(data: ReturnType<typeof summaryData>, cache?: CacheInfo): string {
+  const lines = [headerLine(`chat ${data.chat} · ${data.source} · ${plural(data.turns.length, "turn")} · ${usageLine(data.usage)}`, cache), ""];
   for (const turn of data.turns) {
     const status = turn.status === "error" ? " · a span ended with an error" : "";
     lines.push(`turn ${turn.turn}  ${turn.startedAt.slice(11, 16)}  ${seconds(turn.durationMs).padStart(7)}  ${plural(turn.steps, "step").padStart(8)}  "${oneLine(turn.user, 70)}"${status}`);
@@ -191,7 +221,7 @@ function spanCounts(spans: OtherSpan[]): string {
   return `${shown.join(", ")}${ranked.length > 3 ? ", …" : ""}`;
 }
 
-export function turnData(conversation: Conversation, index: StepIndex, turnNumber: number, cmd: Commands) {
+export function turnData(conversation: Conversation, index: StepIndex, turnNumber: number, cmd: Commands, cache?: CacheInfo) {
   const turn = conversation.turns[turnNumber - 1];
   if (!turn) throw new Error(`turn ${turnNumber} missing`);
   const showAgent = hasSeveralAgents(conversation);
@@ -199,6 +229,7 @@ export function turnData(conversation: Conversation, index: StepIndex, turnNumbe
   const turnStart = Date.parse(turn.startedAt);
   const lastPrompt = [...steps].reverse().find((step) => step.kind === "model" && step.call.context);
   return {
+    ...cacheFields(cache),
     chat: conversation.id,
     turn: turnNumber,
     of: conversation.turns.length,
@@ -232,9 +263,9 @@ export function turnData(conversation: Conversation, index: StepIndex, turnNumbe
   };
 }
 
-export function renderTurn(data: ReturnType<typeof turnData>): string {
+export function renderTurn(data: ReturnType<typeof turnData>, cache?: CacheInfo): string {
   const status = data.status === "error" ? " · a span ended with an error" : "";
-  const lines = [`chat ${data.chat} · turn ${data.turn} of ${data.of} · ${data.startedAt.slice(11, 19)} · ${seconds(data.durationMs)} · ${plural(data.steps.length, "step")}${status}`, "", `user: ${data.user}`, ""];
+  const lines = [headerLine(`chat ${data.chat} · turn ${data.turn} of ${data.of} · ${data.startedAt.slice(11, 19)} · ${seconds(data.durationMs)} · ${plural(data.steps.length, "step")}${status}`, cache), "", `user: ${data.user}`, ""];
   const kindWidth = Math.max(9, ...data.steps.map((step) => step.kind.length));
   const detailPad = " ".repeat(3 + 2 + 8 + 2 + 7 + 2 + kindWidth + 2);
   const rows = [
@@ -262,7 +293,7 @@ export function renderTurn(data: ReturnType<typeof turnData>): string {
   return lines.join("\n");
 }
 
-export function stepData(conversation: Conversation, index: StepIndex, step: Step, cmd: Commands) {
+export function stepData(conversation: Conversation, index: StepIndex, step: Step, cmd: Commands, cache?: CacheInfo) {
   const ref = { turn: step.turn, step: step.number };
   const total = index.steps(step.turn).length;
   const timing = { offsetMs: step.offsetMs, durationMs: step.durationMs, alongside: step.alongside };
@@ -270,6 +301,7 @@ export function stepData(conversation: Conversation, index: StepIndex, step: Ste
     const result = resultText(step.tool.output);
     const requester = step.tool.callId ? index.requestingStep(step.tool.callId) : undefined;
     return {
+      ...cacheFields(cache),
       kind: "tool" as const,
       chat: conversation.id,
       turn: step.turn,
@@ -287,6 +319,7 @@ export function stepData(conversation: Conversation, index: StepIndex, step: Ste
     };
   }
   return {
+    ...cacheFields(cache),
     kind: "model" as const,
     chat: conversation.id,
     turn: step.turn,
@@ -319,10 +352,10 @@ function timingLine(data: { offsetMs: number; durationMs: number; alongside: num
   return [`started ${offset(data.offsetMs)} into the turn`, `took ${seconds(data.durationMs)}`, alongsideText(data.alongside)].filter(Boolean).join(" · ");
 }
 
-export function renderStep(data: ReturnType<typeof stepData>, limit: TextLimit): string {
+export function renderStep(data: ReturnType<typeof stepData>, limit: TextLimit, cache?: CacheInfo): string {
   const lines: string[] = [];
   if (data.kind === "tool") {
-    lines.push(`chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · tool ${data.tool} · ${data.status === "error" ? "failed" : "ok"}`, timingLine(data), "");
+    lines.push(headerLine(`chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · tool ${data.tool} · ${data.status === "error" ? "failed" : "ok"}`, cache), timingLine(data), "");
     lines.push(...block("input", pretty(data.input ?? ""), limit, data.open), "");
     lines.push(...block(`result (~${formatTokens(data.resultTokens)} tokens)`, data.result || "(not recorded)", limit, data.open));
     if (data.error) lines.push("", "error", indent(data.error));
@@ -330,7 +363,7 @@ export function renderStep(data: ReturnType<typeof stepData>, limit: TextLimit):
     return lines.join("\n");
   }
   lines.push(
-    `chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · model ${data.agent} · ${data.model}`,
+    headerLine(`chat ${data.chat} · turn ${data.turn} · step ${data.step} of ${data.of} · model ${data.agent} · ${data.model}`, cache),
     timingLine(data),
     `${usageLine(data.usage)}${data.finishReason ? ` · finished: ${data.finishReason}` : ""}`,
   );
@@ -345,11 +378,12 @@ export function renderStep(data: ReturnType<typeof stepData>, limit: TextLimit):
   return lines.join("\n");
 }
 
-export function promptData(index: StepIndex, step: Extract<Step, { kind: "model" }>, cmd: Commands) {
+export function promptData(index: StepIndex, step: Extract<Step, { kind: "model" }>, cmd: Commands, cache?: CacheInfo) {
   const breakdown = promptBreakdown(step.call, index);
   if (!breakdown) return undefined;
   const ref = { turn: step.turn, step: step.number };
   return {
+    ...cacheFields(cache),
     chat: index.conversation.id,
     turn: step.turn,
     step: step.number,
@@ -387,12 +421,12 @@ function toolsLine(tools: PromptData["tools"]): string {
   return `tools: ${plural(tools.names.length, "name")} recorded, definitions not recorded`;
 }
 
-function promptHeader(data: PromptData, what: string): string[] {
-  return [`chat ${data.chat} · turn ${data.turn} · step ${data.step} · ${what}`, `reported by the provider: ${usageLine(data.usage)}`];
+function promptHeader(data: PromptData, what: string, cache?: CacheInfo): string[] {
+  return [headerLine(`chat ${data.chat} · turn ${data.turn} · step ${data.step} · ${what}`, cache), `reported by the provider: ${usageLine(data.usage)}`];
 }
 
-export function renderPrompt(data: PromptData): string {
-  const lines = [...promptHeader(data, "what the model received, in the order it was sent"), "sizes below are estimates (o200k tokenizer)", ""];
+export function renderPrompt(data: PromptData, cache?: CacheInfo): string {
+  const lines = [...promptHeader(data, "what the model received, in the order it was sent", cache), "sizes below are estimates (o200k tokenizer)", ""];
   const row = (tokens: number | undefined, text: string, depth = 0) => {
     const size = tokens === undefined ? "" : formatTokens(tokens);
     lines.push(`${" ".repeat(depth * 9)}${size.padStart(7)}  ${text}`);
@@ -408,8 +442,8 @@ export function renderPrompt(data: PromptData): string {
   return lines.join("\n");
 }
 
-export function renderFullPrompt(data: PromptData): string {
-  const lines = [...promptHeader(data, "everything the model received, verbatim, in the order it was sent"), ""];
+export function renderFullPrompt(data: PromptData, cache?: CacheInfo): string {
+  const lines = [...promptHeader(data, "everything the model received, verbatim, in the order it was sent", cache), ""];
   const heading = (text: string) => lines.push(`━━━ ${text}`, "");
   heading(`system prompt · ~${formatTokens(data.system.tokens)} tokens · ${plural(data.system.sections.length, "section")}`);
   lines.push(data.system.text, "");
@@ -484,7 +518,7 @@ export function find(conversation: Conversation, index: StepIndex, options: { te
   return hits;
 }
 
-export function renderFind(chat: string, hits: FindHit[]): string {
-  const header = `chat ${chat} · ${hits.length === 0 ? "no matches" : `${hits.length} ${hits.length === 1 ? "match" : "matches"}`}`;
+export function renderFind(chat: string, hits: FindHit[], cache?: CacheInfo): string {
+  const header = headerLine(`chat ${chat} · ${hits.length === 0 ? "no matches" : `${hits.length} ${hits.length === 1 ? "match" : "matches"}`}`, cache);
   return [header, ...hits.map((hit) => `turn ${hit.turn}${hit.step ? ` step ${hit.step}` : ""}  ${hit.where}\n    ${hit.snippet}\n    → ${hit.open}`)].join("\n");
 }

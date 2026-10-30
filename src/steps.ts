@@ -163,15 +163,15 @@ function ref(step: Step | undefined): StepRef | undefined {
 }
 
 function historyItems(messages: Message[], index: StepIndex): PromptItem[] {
-  const items: Omit<PromptItem, "number">[] = [];
-  messages.forEach((message, messageIndex) => {
-    const number = messageIndex + 1;
+  type PromptItemDraft = Omit<PromptItem, "number" | "label"> & { label: (number: number) => string };
+  const items: PromptItemDraft[] = [];
+  messages.forEach((message) => {
     if (message.role === "tool" || message.parts.every((part) => part.kind === "tool_result")) {
       for (const part of message.parts) {
         if (part.kind !== "tool_result") continue;
         const step = index.toolStep(part.callId);
         const name = step?.kind === "tool" ? step.tool.name : "a tool";
-        items.push({ role: message.role, label: `result of ${name}${part.status === "error" ? " (error)" : ""}`, tokens: partTokens(part), ref: ref(step), text: textOf([part]) });
+        items.push({ role: message.role, label: () => `result of ${name}${part.status === "error" ? " (error)" : ""}`, tokens: partTokens(part), ref: ref(step), text: textOf([part]) });
       }
       return;
     }
@@ -180,10 +180,10 @@ function historyItems(messages: Message[], index: StepIndex): PromptItem[] {
       const turn = index.userTurn(text);
       for (const part of message.parts.filter((item) => item.kind === "media")) {
         const size = part.kind === "media" && part.width ? ` ${part.width}x${part.height}` : "";
-        items.push({ role: message.role, label: `image${size} from ${turn ? `turn ${turn}` : "the user"}`, tokens: partTokens(part), text: textOf([part]) });
+        items.push({ role: message.role, label: () => `image${size} from ${turn ? `turn ${turn}` : "the user"}`, tokens: partTokens(part), text: textOf([part]) });
       }
       const textTokens = message.parts.filter((part) => part.kind !== "media").reduce((sum, part) => sum + partTokens(part), 0);
-      if (textTokens > 0) items.push({ role: message.role, label: turn ? `user message, turn ${turn}` : `user message ${number}`, tokens: textTokens, text });
+      if (textTokens > 0) items.push({ role: message.role, label: (number) => (turn ? `user message, turn ${turn}` : `user message ${number}`), tokens: textTokens, text });
       return;
     }
     const tokens = message.parts.reduce((sum, part) => sum + partTokens(part), 0);
@@ -191,9 +191,12 @@ function historyItems(messages: Message[], index: StepIndex): PromptItem[] {
     const call = message.parts.find((part) => part.kind === "tool_call");
     const step = (call && call.kind === "tool_call" ? index.requestingStep(call.id) : undefined) ?? (text ? index.replyStep(text) : undefined);
     const what = call ? "model asked for tools" : "model reply";
-    items.push({ role: message.role, label: step ? what : `${what} (message ${number}, no matching step)`, tokens, ref: ref(step), text: textOf(message.parts) });
+    items.push({ role: message.role, label: (number) => (step ? what : `${what} (message ${number}, no matching step)`), tokens, ref: ref(step), text: textOf(message.parts) });
   });
-  return items.map((item, position) => ({ ...item, number: position + 1 }));
+  return items.map((item, position) => {
+    const number = position + 1;
+    return { ...item, number, label: item.label(number) };
+  });
 }
 
 export function promptBreakdown(call: ModelCall, index: StepIndex): PromptBreakdown | undefined {

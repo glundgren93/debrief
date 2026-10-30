@@ -16,6 +16,13 @@ export interface Loaded {
   sourceName: string;
   warnings: string[];
   fromCache: boolean;
+  fetchedAt?: number;
+}
+
+interface CacheEntry {
+  fetchedAt: number;
+  warnings: string[];
+  spans: string;
 }
 
 export function cacheDir(): string {
@@ -50,6 +57,20 @@ function prepareCache(cacheTtlMs: number): void {
     } else {
       chmodSync(path, 0o600);
     }
+  }
+}
+
+function readCache(path: string): CacheEntry | undefined {
+  try {
+    const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (typeof value !== "object" || value === null) return undefined;
+    const entry = value as { fetchedAt?: unknown; warnings?: unknown; spans?: unknown };
+    if (typeof entry.fetchedAt !== "number" || !Array.isArray(entry.warnings) || !entry.warnings.every((warning) => typeof warning === "string") || typeof entry.spans !== "string") {
+      return undefined;
+    }
+    return { fetchedAt: entry.fetchedAt, warnings: entry.warnings, spans: entry.spans };
+  } catch {
+    return undefined;
   }
 }
 
@@ -100,15 +121,26 @@ export async function load(resolved: ResolvedInput, config: Config, options: Loa
     return { spans: parseAndRedact(text, config.redact), sourceName: "file", warnings: [], fromCache: false };
   }
   const path = cachePath(resolved.source, resolved.id);
-  if (!options.refresh && existsSync(path) && Date.now() - statSync(path).mtimeMs < options.cacheTtlMs) {
-    return { spans: parseCachedSpans(readFileSync(path, "utf8"), config.redact), sourceName: resolved.source.name, warnings: [], fromCache: true };
+  if (!options.refresh && existsSync(path)) {
+    const cached = readCache(path);
+    if (cached && Date.now() - cached.fetchedAt < options.cacheTtlMs) {
+      return {
+        spans: parseCachedSpans(cached.spans, config.redact),
+        sourceName: resolved.source.name,
+        warnings: cached.warnings,
+        fromCache: true,
+        fetchedAt: cached.fetchedAt,
+      };
+    }
   }
   const result = await fetchCloudWatchSpans(resolved.source, resolved.id);
   const text = redact(result.records.join("\n"), config.redact);
   const spans = text.trim() ? parseAndRedact(text, config.redact) : [];
+  const fetchedAt = Date.now();
   if (result.records.length > 0) {
-    writeFileSync(path, spans.map((span) => JSON.stringify(span)).join("\n"), { mode: 0o600 });
+    const cached: CacheEntry = { fetchedAt, warnings: result.warnings, spans: spans.map((span) => JSON.stringify(span)).join("\n") };
+    writeFileSync(path, JSON.stringify(cached), { mode: 0o600 });
     chmodSync(path, 0o600);
   }
-  return { spans, sourceName: resolved.source.name, warnings: result.warnings, fromCache: false };
+  return { spans, sourceName: resolved.source.name, warnings: result.warnings, fromCache: false, fetchedAt };
 }

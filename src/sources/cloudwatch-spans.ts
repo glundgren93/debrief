@@ -57,7 +57,7 @@ export async function fetchCloudWatchSpans(source: CloudWatchSourceConfig, id: s
   const attribute = source.attribute ?? "session.id";
   const end = Math.floor(Date.now() / 1000);
   const start = end - (source.lookbackDays ?? 30) * 86400;
-  const queryString = `filter \`attributes.${attribute}\` = ${insightsString(id)} | fields @message | limit ${RESULT_LIMIT}`;
+  const queryString = `filter \`attributes.${attribute}\` = ${insightsString(id)} | sort startTimeUnixNano asc | fields @message | limit ${RESULT_LIMIT}`;
   let queryId: string | undefined;
   try {
     const started = await logs.send(
@@ -78,7 +78,7 @@ export async function fetchCloudWatchSpans(source: CloudWatchSourceConfig, id: s
     const result = await logs.send(new GetQueryResultsCommand({ queryId }));
     if (result.status === "Complete") {
       const records = (result.results ?? []).flatMap((row) => row.filter((field) => field.field === "@message").map((field) => field.value ?? ""));
-      const warnings = records.length >= RESULT_LIMIT ? [`Hit the ${RESULT_LIMIT} span limit; the conversation may be incomplete.`] : [];
+      const warnings = records.length >= RESULT_LIMIT ? [`Hit the ${RESULT_LIMIT} span limit; later turns may be missing.`] : [];
       return { records, warnings };
     }
     if (result.status === "Failed" || result.status === "Cancelled" || result.status === "Timeout") {

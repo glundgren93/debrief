@@ -91,7 +91,12 @@ async function loadChat(chat: string, refresh: boolean) {
   if (loaded.spans.length === 0) throw new NotFoundError(`No traces found for ${resolved.id} in ${loaded.sourceName}.`);
   const conversation = buildConversation(resolved.id, loaded.sourceName, loaded.spans);
   const reference = resolved.kind === "source" ? `${resolved.source.name}:${resolved.id}` : chat;
-  return { conversation, index: new StepIndex(conversation), reference };
+  return {
+    conversation,
+    index: new StepIndex(conversation),
+    reference,
+    cache: { fromCache: loaded.fromCache, fetchedAt: loaded.fetchedAt },
+  };
 }
 
 async function main(): Promise<number> {
@@ -130,19 +135,19 @@ async function main(): Promise<number> {
     throw new UsageError(`"${command}" is not a command.${guess ? ` Did you mean "${guess}"?` : ""} Run: ${BIN} help`);
   }
 
-  const { conversation, index, reference } = await loadChat(chat, values.refresh);
+  const { conversation, index, reference, cache } = await loadChat(chat, values.refresh);
   const cmd = commandsFor(reference);
 
   if (!command) {
-    const data = summaryData(conversation, index, cmd);
-    print(renderSummary(data), data);
+    const data = summaryData(conversation, index, cmd, cache);
+    print(renderSummary(data, cache), data);
     return 0;
   }
 
   if (command === "find") {
     if (!argument && !values.errors) throw new UsageError(`usage: ${BIN} <chat> find TEXT   or   ${BIN} <chat> find --errors`);
     const hits = find(conversation, index, { text: argument, errors: values.errors }, cmd);
-    print(renderFind(conversation.id, hits), { chat: conversation.id, hits });
+    print(renderFind(conversation.id, hits, cache), { chat: conversation.id, hits, fromCache: cache.fromCache });
     return 0;
   }
 
@@ -155,12 +160,12 @@ async function main(): Promise<number> {
   if (stepNumber === undefined) {
     if (values.prompt || values.section || values.message) throw new UsageError(`--prompt needs a step: ${cmd.turn(turn)} --step S --prompt`);
     if (values.all) {
-      const steps = index.steps(turn).map((step) => stepData(conversation, index, step, cmd));
-      print(steps.map((step) => renderStep(step, limit)).join("\n\n────────\n\n"), steps);
+      const steps = index.steps(turn).map((step) => stepData(conversation, index, step, cmd, cache));
+      print(steps.map((step) => renderStep(step, limit, cache)).join("\n\n────────\n\n"), steps);
       return 0;
     }
-    const data = turnData(conversation, index, turn, cmd);
-    print(renderTurn(data), data);
+    const data = turnData(conversation, index, turn, cmd, cache);
+    print(renderTurn(data, cache), data);
     return 0;
   }
 
@@ -169,7 +174,7 @@ async function main(): Promise<number> {
 
   if (values.prompt || values.section || values.message) {
     if (step.kind !== "model") throw new UsageError(`Step ${stepNumber} is a tool run, not a model call; only model calls have a prompt. See: ${cmd.turn(turn)}`);
-    const data = promptData(index, step, cmd);
+    const data = promptData(index, step, cmd, cache);
     if (!data) throw new NotFoundError(`The prompt for turn ${turn} step ${stepNumber} was not recorded.`);
     if (values.section) {
       const section = data.system.sections.find((item) => item.name === values.section);
@@ -178,22 +183,22 @@ async function main(): Promise<number> {
         const close = names.filter((name) => name.includes(values.section ?? "") || (values.section ?? "").includes(name));
         throw new NotFoundError(`No section "${values.section}".${close.length > 0 ? ` Did you mean: ${close.join(", ")}?` : ""} Sections: ${names.join(", ")}`);
       }
-      print(section.text, { turn, step: stepNumber, section: section.name, tokens: section.tokens, text: section.text });
+      print(section.text, { turn, step: stepNumber, section: section.name, tokens: section.tokens, text: section.text, fromCache: cache.fromCache });
       return 0;
     }
     if (values.message) {
       const number = positiveInt(values.message, "--message");
       const item = data.messages.items.find((candidate) => candidate.number === number);
       if (!item) throw new NotFoundError(`There is no message item ${values.message}; this prompt has ${data.messages.items.length}. See: ${data.open}`);
-      print(item.text, { turn, step: stepNumber, ...item });
+      print(item.text, { turn, step: stepNumber, ...item, fromCache: cache.fromCache });
       return 0;
     }
-    print(values.full ? renderFullPrompt(data) : renderPrompt(data), data);
+    print(values.full ? renderFullPrompt(data, cache) : renderPrompt(data, cache), data);
     return 0;
   }
 
-  const data = stepData(conversation, index, step, cmd);
-  print(renderStep(data, limit), data);
+  const data = stepData(conversation, index, step, cmd, cache);
+  print(renderStep(data, limit, cache), data);
   return 0;
 }
 
