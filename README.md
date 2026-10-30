@@ -204,14 +204,15 @@ sources:
     logGroup: aws/spans
     attribute: session.id
     lookbackDays: 30
-    credentialProcess: "aws-vault export --format=json my-profile"
+    profile: my-profile
 redact:
   - "sk-[A-Za-z0-9]{20,}"
 ```
 
 - `match` pulls the conversation id out of a link (named group `id`).
 - `attribute` is the span attribute that holds that id on every span. `session.id` is the common choice. Set it with OpenTelemetry baggage so it reaches every span.
-- Credentials come from `credentialProcess` (any command that prints AWS `credential_process` JSON), else `profile`, else the default AWS chain.
+- Credentials come from `profile`, else the default AWS chain. `credentialProcess` is honored only in user-owned config: `$DEBRIEF_CONFIG`, an explicit config path, or `~/.config/debrief/config.yaml`. If it appears in a project `.debrief.yaml`, debrief ignores it and warns to use `profile:` instead. A command string is supported for trusted user config; an argv array such as `["aws-vault", "export", "--format=json", "my-profile"]` runs without a shell.
+- AWS profiles can keep their `credential_process` command in the user-owned `~/.aws/config` file.
 
 ### What your traces need
 
