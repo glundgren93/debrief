@@ -25,7 +25,7 @@ export interface Config {
 }
 
 export const DEFAULT_REDACTIONS = [
-  "eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}",
+  "eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*",
   "(?:AKIA|ASIA)[A-Z0-9]{16}",
 ];
 
