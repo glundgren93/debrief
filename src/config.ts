@@ -12,7 +12,7 @@ export interface CloudWatchSourceConfig {
   attribute?: string;
   lookbackDays?: number;
   profile?: string;
-  credentialProcess?: string;
+  credentialProcess?: string | string[];
 }
 
 export type SourceConfig = CloudWatchSourceConfig;
@@ -21,6 +21,7 @@ export interface Config {
   sources: SourceConfig[];
   redact: string[];
   files: string[];
+  warnings?: string[];
 }
 
 export const DEFAULT_REDACTIONS = [
@@ -50,23 +51,51 @@ function validate(source: SourceConfig, file: string): SourceConfig {
   if (!source.name) throw new Error(`${file}: every source needs a name`);
   if (source.type !== "cloudwatch-spans") throw new Error(`${file}: source ${source.name} has unsupported type ${String(source.type)}`);
   if (!source.region) throw new Error(`${file}: source ${source.name} needs a region`);
+  if (
+    source.credentialProcess !== undefined &&
+    typeof source.credentialProcess !== "string" &&
+    (!Array.isArray(source.credentialProcess) || source.credentialProcess.length === 0 || source.credentialProcess.some((part) => typeof part !== "string"))
+  ) {
+    throw new Error(`${file}: source ${source.name} credentialProcess must be a command string or non-empty argv array`);
+  }
   return source;
 }
 
+interface ConfigCandidate {
+  path: string;
+  project: boolean;
+}
+
 export function loadConfig(explicitPath?: string, cwd = process.cwd()): Config {
-  const candidates = explicitPath
-    ? [resolve(explicitPath)]
-    : [process.env.DEBRIEF_CONFIG, projectConfigPath(cwd), join(homedir(), ".config", "debrief", "config.yaml")].filter(
-        (path): path is string => Boolean(path && existsSync(path)),
-      );
-  const config: Config = { sources: [], redact: [...DEFAULT_REDACTIONS], files: [] };
-  for (const file of [...new Set(candidates)]) {
-    const partial = readConfigFile(file);
+  const project = projectConfigPath(cwd);
+  const candidates: ConfigCandidate[] = explicitPath
+    ? [{ path: resolve(explicitPath), project: false }]
+    : [
+        { path: process.env.DEBRIEF_CONFIG, project: false },
+        { path: join(homedir(), ".config", "debrief", "config.yaml"), project: false },
+        { path: project, project: true },
+      ].filter((candidate): candidate is ConfigCandidate => Boolean(candidate.path && existsSync(candidate.path)));
+  const warnings: string[] = [];
+  const config: Config = { sources: [], redact: [...DEFAULT_REDACTIONS], files: [], warnings };
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    if (seen.has(candidate.path)) continue;
+    seen.add(candidate.path);
+    const partial = readConfigFile(candidate.path);
     for (const source of partial.sources ?? []) {
-      if (!config.sources.some((existing) => existing.name === source.name)) config.sources.push(validate(source, file));
+      const validated = validate(source, candidate.path);
+      let trusted = validated;
+      if (candidate.project && validated.credentialProcess !== undefined) {
+        warnings.push(
+          `Ignoring credentialProcess for source ${validated.name} in project config ${candidate.path}; use profile: instead and keep credential_process in a user-owned AWS config.`,
+        );
+        const { credentialProcess: _, ...withoutCredentialProcess } = validated;
+        trusted = withoutCredentialProcess;
+      }
+      if (!config.sources.some((existing) => existing.name === trusted.name)) config.sources.push(trusted);
     }
     config.redact.push(...(partial.redact ?? []));
-    config.files.push(file);
+    config.files.push(candidate.path);
   }
   return config;
 }

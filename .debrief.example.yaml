@@ -6,6 +6,6 @@ sources:
     logGroup: aws/spans
     attribute: session.id
     lookbackDays: 30
-    credentialProcess: "aws-vault export --format=json my-profile"
+    profile: my-profile
 redact:
   - "sk-[A-Za-z0-9]{20,}"

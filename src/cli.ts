@@ -84,6 +84,7 @@ function positiveInt(value: string | undefined, what: string): number | undefine
 
 async function loadChat(chat: string, refresh: boolean) {
   const config = loadConfig();
+  for (const warning of config.warnings ?? []) console.error(`warning: ${warning}`);
   const resolved = resolveInput(chat, config);
   const loaded = await load(resolved, config, { refresh, cacheTtlMs: 24 * 3600 * 1000 });
   for (const warning of loaded.warnings) console.error(`warning: ${warning}`);

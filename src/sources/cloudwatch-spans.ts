@@ -11,15 +11,19 @@ interface ProcessCredentials {
   Expiration?: string;
 }
 
-function credentialsFromProcess(command: string) {
+function credentialsFromProcess(command: string | string[]) {
   const env = { ...process.env };
   for (const key of ["AWS_VAULT", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"]) delete env[key];
+  const args = Array.isArray(command) ? [...command] : ["-c", command];
+  const executable = Array.isArray(command) ? args.shift() : "/bin/sh";
+  if (!executable) throw new SourceError("Credential command must not be empty");
+  const displayCommand = Array.isArray(command) ? command.join(" ") : command;
   let output: string;
   try {
-    output = execFileSync("/bin/sh", ["-c", command], { env, encoding: "utf8", stdio: ["inherit", "pipe", "pipe"], timeout: 120_000 });
+    output = execFileSync(executable, args, { env, encoding: "utf8", stdio: ["inherit", "pipe", "pipe"], timeout: 120_000 });
   } catch (error) {
     const stderr = (error as { stderr?: string }).stderr?.trim();
-    throw new SourceError(`Credential command failed: ${command}${stderr ? `\n${stderr}` : ""}`);
+    throw new SourceError(`Credential command failed: ${displayCommand}${stderr ? `\n${stderr}` : ""}`);
   }
   const parsed = JSON.parse(output) as ProcessCredentials;
   return {
